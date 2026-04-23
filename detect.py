@@ -227,19 +227,22 @@ def _read_thermal_zone(zone: int = 0) -> float:
 def start_thermal_monitor(cfg: dict):
     def _run():
         while True:
-            # Jetson Orin: thermal_zone0 is CPU cluster, zone7 is GPU
-            # We read both and take max
-            temps = [_read_thermal_zone(i) for i in range(10)]
-            t = max(t for t in temps if t > 0) if any(t > 0 for t in temps) else 0.0
-            _hset(thermal_c=round(t, 1))
-            if t >= cfg["thermal_crit_c"]:
-                log.error(f"THERMAL CRITICAL: {t:.1f}°C — consider throttling")
-                emit_alert(cfg["camera_id"], "thermal", {
-                    "temp_c": t, "severity": "high",
-                    "label": f"Thermal critical: {t:.1f}°C"
-                })
-            elif t >= cfg["thermal_warn_c"]:
-                log.warning(f"Thermal warning: {t:.1f}°C")
+            try:
+                # Jetson Orin: thermal_zone0 is CPU cluster, zone7 is GPU
+                # We read both and take max
+                temps = [_read_thermal_zone(i) for i in range(10)]
+                t = max(t for t in temps if t > 0) if any(t > 0 for t in temps) else 0.0
+                _hset(thermal_c=round(t, 1))
+                if t >= cfg["thermal_crit_c"]:
+                    log.error(f"THERMAL CRITICAL: {t:.1f}°C — consider throttling")
+                    emit_alert(cfg["camera_id"], "thermal", {
+                        "temp_c": t, "severity": "high",
+                        "label": f"Thermal critical: {t:.1f}°C"
+                    })
+                elif t >= cfg["thermal_warn_c"]:
+                    log.warning(f"Thermal warning: {t:.1f}°C")
+            except Exception:
+                log.exception("THERMAL MONITOR error — continuing")
             time.sleep(15)
 
     threading.Thread(target=_run, daemon=True, name="thermal").start()
