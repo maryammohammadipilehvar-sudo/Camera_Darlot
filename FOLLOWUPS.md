@@ -11,7 +11,7 @@ sufficient context to pick up in a future session.
 - VERSION2 signature: `on_connect(client, userdata, flags, reason_code, properties)` — `reason_code` replaces `rc`, `properties` added
 - Low urgency; do before paho 3.x release.
 
-### ByteTrack import broken in current boxmot
+### ByteTrack import broken in current boxmot — RESOLVED (2026-04-23, `5a1b935`)
 
 - Observed in Q4 foreground run: `cannot import name 'ByteTrack' from 'boxmot'`
 - Effect: multi-object tracking is disabled in production right now; Risk #3 (zone loitering track_id=0 collapse) is active, not theoretical
@@ -19,6 +19,7 @@ sufficient context to pick up in a future session.
 - boxmot restructured tracker imports in recent versions; likely need `from boxmot.trackers.bytetrack.bytetrack import ByteTrack` or similar
 - High urgency — tracking underpins behavior analysis, zone dwell, and alert dedup
 - Candidate for next session after Q4/Q7 wrap up
+- **Resolution:** Session 2. Switched to `from boxmot.trackers.bytetrack.bytetrack import ByteTrack`; split init into import vs construction try blocks with loud `TRACKING DISABLED` logging. Pinned `boxmot>=10.0.43,<18.1` in requirements.txt. Verified live: `track_id=1` persisted across 41 frames with evolving coordinates.
 
 ### Engine lacks ultralytics metadata
 
