@@ -232,9 +232,10 @@ If `models/patchcore_memory.pt` is ever overwritten from an untrusted source, th
 If the broker is down at startup, the worker `while True: client.connect(...); time.sleep(5)` loops forever. A SIGTERM flips `running=False` in main, but the MQTT thread has no reference to that flag. It's a daemon thread so it dies with the process — but no final log line or drain attempt runs.
 **Fix:** pass a stop-event and check it in the retry loop; also drain the alert queue on shutdown.
 
-**10. `thermal_monitor` crash kills thermal alerting silently.** — `detect.py:227–246`.
+**10. `thermal_monitor` crash kills thermal alerting silently.** — `detect.py:227–246`. **RESOLVED 2026-04-23, `0f6cfee`.**
 The loop body has no `try/except`. If `_read_thermal_zone` starts returning non-ints (e.g., a BSP update changes the sysfs format), or `emit_alert` ever raises, the thread exits and there is no log record at that level to tell you thermal monitoring is gone. Same pattern in `_mqtt_worker`'s publish loop (`detect.py:286–305` — protected) and in `BehaviorAnalyzer._worker` (`behavior.py:321` — catches implicitly via the pose `try`, but not the classify path).
 **Fix:** wrap the thermal loop body in `try/except Exception: log.exception(...); continue`.
+**Resolution:** Session 2. Loop body wrapped in `try/except Exception` with `log.exception("THERMAL MONITOR error — continuing")`. `time.sleep(15)` kept outside the try block so both success and exception paths observe the normal 15-second cadence (no tight-spin on repeated failures). No explicit `continue` needed — natural fall-through preserves timing. Greppable prefix matches Fix A's "TRACKING DISABLED" convention.
 
 ---
 
