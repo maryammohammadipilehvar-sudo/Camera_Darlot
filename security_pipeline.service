@@ -1,0 +1,19 @@
+[Unit]
+Description=AI Security Detection Pipeline
+After=network-online.target mosquitto.service
+Wants=network-online.target mosquitto.service
+
+[Service]
+Type=simple
+User=quarero
+WorkingDirectory=/home/quarero/Desktop/security_pipeline
+Environment="PATH=/home/quarero/Desktop/security_pipeline/.venv/bin:/usr/local/cuda/bin:/usr/src/tensorrt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="YOLO_CONFIG_DIR=/tmp/Ultralytics"
+ExecStart=/home/quarero/Desktop/security_pipeline/.venv/bin/python /home/quarero/Desktop/security_pipeline/detect.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,483 @@
+"""
+behavior.py — Per-track behavior analysis + next-action prediction.
+
+Architecture:
+  YOLOv8n-pose (TRT FP16, ~8ms on Orin) → 17-keypoint COCO skeleton
+  → per-track sliding window (16 frames) → rule-based action classifier
+  → simple Markov next-action predictor
+  → emits MQTT alerts for: fallen, running, loitering, crouching, fighting
+
+Designed to run in a dedicated daemon thread.
+Feed frames + detection tracks via queue; results available via BehaviorState.
+
+Usage in detect.py:
+    from behavior import BehaviorAnalyzer
+    beh = BehaviorAnalyzer("models/yolov8n-pose.pt")
+    beh.start_thread(emit_alert_fn, camera_id)
+    ...
+    beh.submit(frame, last_tracks, timestamp)
+    labels = beh.get_labels()   # dict track_id → ActionLabel
+"""
+
+from __future__ import annotations
+
+import collections
+import logging
+import math
+import queue
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional, Tuple
+
+import cv2
+import numpy as np
+
+log = logging.getLogger("behavior")
+
+# ── COCO keypoint indices ──────────────────────────────────────────────────────
+KP_NOSE, KP_L_EYE, KP_R_EYE   = 0, 1, 2
+KP_L_EAR, KP_R_EAR             = 3, 4
+KP_L_SHOULDER, KP_R_SHOULDER   = 5, 6
+KP_L_ELBOW, KP_R_ELBOW         = 7, 8
+KP_L_WRIST, KP_R_WRIST         = 9, 10
+KP_L_HIP, KP_R_HIP             = 11, 12
+KP_L_KNEE, KP_R_KNEE           = 13, 14
+KP_L_ANKLE, KP_R_ANKLE         = 15, 16
+
+# ── Action taxonomy ────────────────────────────────────────────────────────────
+class Action:
+    UNKNOWN    = "unknown"
+    STANDING   = "standing"
+    WALKING    = "walking"
+    RUNNING    = "running"
+    CROUCHING  = "crouching"
+    FALLEN     = "fallen"
+    RAISING    = "raising_arm"   # arms above shoulders
+    FIGHTING   = "fighting"      # high limb velocity
+
+
+# Transition map used for next-action prediction (simple Markov)
+_TRANSITIONS: Dict[str, List[Tuple[str, float]]] = {
+    Action.STANDING:  [(Action.WALKING, .45), (Action.STANDING, .40), (Action.CROUCHING, .10), (Action.RUNNING, .05)],
+    Action.WALKING:   [(Action.WALKING, .50), (Action.STANDING, .25), (Action.RUNNING, .20), (Action.CROUCHING, .05)],
+    Action.RUNNING:   [(Action.RUNNING, .50), (Action.WALKING, .35), (Action.STANDING, .15)],
+    Action.CROUCHING: [(Action.CROUCHING, .40), (Action.STANDING, .35), (Action.WALKING, .20), (Action.FALLEN, .05)],
+    Action.FALLEN:    [(Action.FALLEN, .70), (Action.CROUCHING, .20), (Action.STANDING, .10)],
+    Action.RAISING:   [(Action.STANDING, .50), (Action.RAISING, .30), (Action.WALKING, .20)],
+    Action.FIGHTING:  [(Action.FIGHTING, .40), (Action.WALKING, .30), (Action.STANDING, .30)],
+    Action.UNKNOWN:   [(Action.STANDING, .50), (Action.WALKING, .30), (Action.UNKNOWN, .20)],
+}
+
+def predict_next(current: str) -> str:
+    """Predict most-likely next action."""
+    options = _TRANSITIONS.get(current, [(Action.UNKNOWN, 1.0)])
+    return max(options, key=lambda x: x[1])[0]
+
+
+# ── Per-track rolling window ───────────────────────────────────────────────────
+@dataclass
+class TrackWindow:
+    track_id:    int
+    window:      int = 16
+    kp_history:  collections.deque = field(default_factory=lambda: collections.deque(maxlen=16))
+    bbox_history: collections.deque = field(default_factory=lambda: collections.deque(maxlen=16))
+    action:      str = Action.UNKNOWN
+    next_action: str = Action.UNKNOWN
+    last_update: float = 0.0
+    alert_ts:    Dict[str, float] = field(default_factory=dict)
+
+    def push(self, kps: Optional[np.ndarray], bbox: Tuple[int,int,int,int]):
+        self.kp_history.append(kps)
+        self.bbox_history.append(bbox)
+        self.last_update = time.time()
+
+    def should_alert(self, action: str, cooldown: float = 10.0) -> bool:
+        now = time.time()
+        if now - self.alert_ts.get(action, 0) >= cooldown:
+            self.alert_ts[action] = now
+            return True
+        return False
+
+
+# ── Keypoint-based action classifier ─────────────────────────────────────────
+class ActionClassifier:
+    """
+    Rule-based classifier operating on bounding box geometry + keypoints.
+    No neural network required — runs in <0.5ms per track on CPU.
+    """
+
+    def classify(self, window: TrackWindow) -> str:
+        if len(window.bbox_history) < 2:
+            return Action.UNKNOWN
+
+        bboxes = list(window.bbox_history)
+        kps    = list(window.kp_history)
+
+        # ── 1. Fallen: bbox is landscape (wide > tall) ─────────────────────────
+        x1,y1,x2,y2 = bboxes[-1]
+        w = max(1, x2-x1);  h = max(1, y2-y1)
+        aspect = w / h
+        if aspect > 1.6:
+            return Action.FALLEN
+
+        # ── 2. Vertical velocity of bounding box center ────────────────────────
+        centers_y = [(b[1]+b[3])/2 for b in bboxes]
+        if len(centers_y) >= 4:
+            vy = abs(centers_y[-1] - centers_y[-4]) / max(h, 1)
+        else:
+            vy = 0.0
+
+        # ── 3. Horizontal velocity ─────────────────────────────────────────────
+        centers_x = [(b[0]+b[2])/2 for b in bboxes]
+        if len(centers_x) >= 4:
+            vx = abs(centers_x[-1] - centers_x[-4]) / max(w, 1)
+        else:
+            vx = 0.0
+
+        speed = math.sqrt(vx**2 + vy**2)
+
+        # ── 4. Keypoint-based refinements (when available) ────────────────────
+        latest_kp = None
+        for kp in reversed(kps):
+            if kp is not None:
+                latest_kp = kp
+                break
+
+        if latest_kp is not None and latest_kp.shape[0] >= 17:
+            lh = latest_kp[KP_L_HIP]
+            rh = latest_kp[KP_R_HIP]
+            ls = latest_kp[KP_L_SHOULDER]
+            rs = latest_kp[KP_R_SHOULDER]
+            lw = latest_kp[KP_L_WRIST]
+            rw = latest_kp[KP_R_WRIST]
+            lk = latest_kp[KP_L_KNEE]
+            rk = latest_kp[KP_R_KNEE]
+
+            hip_y = (lh[1]+rh[1]) / 2
+            sho_y = (ls[1]+rs[1]) / 2
+            kne_y = (lk[1]+rk[1]) / 2
+
+            # Torso height ratio vs total bbox height
+            torso_h = abs(hip_y - sho_y)
+            total_h = max(h, 1)
+            torso_ratio = torso_h / total_h
+
+            # Sitting: hips close to knees, torso still visible
+            knee_hip_gap = abs(kne_y - hip_y) / total_h
+            if torso_ratio >= 0.18 and knee_hip_gap < 0.22 and speed < 0.08:
+                return "sitting"
+
+            # Sitting: auto rule
+
+            knee_hip_gap = abs(kne_y - hip_y) / total_h
+
+            if 0.16 <= torso_ratio <= 0.60 and knee_hip_gap < 0.42 and speed < 0.14:
+
+                return "sitting"
+
+
+            # Crouching: torso compressed and knees near hip level
+            if torso_ratio < 0.25 and abs(kne_y - hip_y) < 0.15 * total_h:
+                return Action.CROUCHING
+
+            # Arms raised: wrist above shoulder
+            arm_raised = (lw[1] < ls[1] - 0.05*total_h) or \
+                         (rw[1] < rs[1] - 0.05*total_h)
+            if arm_raised and speed < 0.08:
+                return Action.RAISING
+
+            # Fighting: large wrist velocity
+            wrist_speeds = []
+            for i in range(1, min(len(kps), 5)):
+                prev = kps[-(i+1)]
+                if prev is not None and prev.shape[0] >= 17:
+                    dlw = np.linalg.norm(kps[-i][KP_L_WRIST][:2] - prev[KP_L_WRIST][:2]) / max(h, 1) \
+                          if kps[-i] is not None else 0
+                    drw = np.linalg.norm(kps[-i][KP_R_WRIST][:2] - prev[KP_R_WRIST][:2]) / max(h, 1) \
+                          if kps[-i] is not None else 0
+                    wrist_speeds.append(max(dlw, drw))
+            if wrist_speeds and max(wrist_speeds) > 0.25:
+                return Action.FIGHTING
+
+        # ── 5. Speed thresholds ────────────────────────────────────────────────
+        if speed > 0.20:
+            return Action.RUNNING
+        if speed > 0.06:
+            return Action.WALKING
+        if aspect > 1.1 and speed < 0.04:
+            return Action.CROUCHING
+
+        return Action.STANDING
+
+
+# ── Pose model wrapper ─────────────────────────────────────────────────────────
+class PoseEstimator:
+    """
+    Wraps YOLOv8n-pose (or any COCO-format pose model loaded via ultralytics).
+    Falls back gracefully if not available.
+    """
+
+    def __init__(self, model_path: str):
+        self._ready = False
+        self.model  = None
+
+        try:
+            from ultralytics import YOLO
+            self.model = YOLO(model_path, task="pose")
+            # Warmup
+            dummy = np.zeros((384, 640, 3), dtype=np.uint8)
+            for _ in range(3):
+                self.model(dummy, device="cuda:0", verbose=False, imgsz=(384, 640))
+            self._ready = True
+            log.info(f"Pose estimator loaded: {model_path}")
+        except Exception as e:
+            log.warning(f"Pose model unavailable ({e}) — behavior will use bbox-only mode")
+
+    @property
+    def ready(self) -> bool:
+        return self._ready
+
+    def infer(self, frame: np.ndarray) -> List[Tuple[np.ndarray, np.ndarray]]:
+        """
+        Returns list of (bbox[4], keypoints[17,3]) for each detected person.
+        bbox = [x1,y1,x2,y2], keypoints[:,2] = confidence.
+        """
+        if not self._ready:
+            return []
+        try:
+            import torch
+            results = self.model(
+                frame,
+                device="cuda:0",
+                verbose=False,
+                conf=0.45,
+                classes=[0],   # person only
+                imgsz=(384, 640),
+            )
+            out = []
+            for r in results:
+                if r.boxes is None or r.keypoints is None:
+                    continue
+                boxes = r.boxes.xyxy.cpu().numpy()   # (N,4)
+                kps   = r.keypoints.data.cpu().numpy() # (N,17,3)
+                for i in range(len(boxes)):
+                    out.append((boxes[i], kps[i]))
+            return out
+        except Exception as e:
+            log.debug(f"Pose infer error: {e}")
+            return []
+
+
+# ── Main analyzer ──────────────────────────────────────────────────────────────
+class BehaviorAnalyzer:
+    """
+    Manages per-track state, runs pose estimation, classifies actions,
+    and optionally emits alerts.
+
+    Thread-safe. Call submit() from the main loop; results are non-blocking.
+    """
+
+    TRACK_TTL = 8.0    # seconds before stale track is pruned
+
+    def __init__(self, pose_model_path: str = "models/yolov8n-pose.pt"):
+        self._pose      = PoseEstimator(pose_model_path)
+        self._classifier = ActionClassifier()
+        self._tracks: Dict[int, TrackWindow] = {}
+        self._lock    = threading.Lock()
+        self._q: queue.Queue = queue.Queue(maxsize=4)
+        self._labels: Dict[int, dict] = {}
+        self._emit_fn: Optional[Callable] = None
+        self._camera_id = "unknown"
+        self._running   = False
+
+    def start_thread(self, emit_fn: Callable, camera_id: str):
+        """Start background analysis thread."""
+        self._emit_fn   = emit_fn
+        self._camera_id = camera_id
+        self._running   = True
+        t = threading.Thread(target=self._worker, daemon=True, name="behavior")
+        t.start()
+        log.info("Behavior analyzer thread started")
+
+    def submit(self, frame: np.ndarray, tracks: np.ndarray, ts: float):
+        """
+        Non-blocking submit. If queue is full, oldest frame is dropped.
+        tracks: numpy array in boxmot format (N, 7+)
+        """
+        if not self._running:
+            return
+        try:
+            self._q.put_nowait((frame.copy(), tracks.copy() if len(tracks) else np.empty((0,7)), ts))
+        except queue.Full:
+            pass  # drop — better to skip than to lag
+
+    def get_labels(self) -> Dict[int, dict]:
+        """Returns latest action labels per track_id. Non-blocking."""
+        with self._lock:
+            return dict(self._labels)
+
+    # ── Background worker ─────────────────────────────────────────────────────
+    def _worker(self):
+        while self._running:
+            try:
+                frame, tracks, ts = self._q.get(timeout=1.0)
+            except queue.Empty:
+                self._prune_stale()
+                continue
+
+            # Only process frames with at least one person track
+            person_tracks = [t for t in tracks if (int(t[6]) == 0 if len(t) > 6 else True)]
+            if not person_tracks:
+                self._prune_stale()
+                continue
+
+            # Run pose inference
+            pose_results = self._pose.infer(frame)
+
+            # Match pose results to ByteTrack tracks by IoU
+            pose_by_track = self._match_pose_to_tracks(person_tracks, pose_results, frame.shape)
+
+            new_labels: Dict[int, dict] = {}
+
+            for t in person_tracks:
+                if len(t) < 5:
+                    continue
+                x1,y1,x2,y2 = int(t[0]),int(t[1]),int(t[2]),int(t[3])
+                track_id = int(t[4]) if len(t) > 4 else -1
+
+                with self._lock:
+                    w = self._tracks.setdefault(track_id, TrackWindow(track_id=track_id))
+
+                kps = pose_by_track.get(track_id)
+                w.push(kps, (x1,y1,x2,y2))
+
+                action      = self._classifier.classify(w)
+                next_action = predict_next(action)
+                w.action      = action
+                w.next_action = next_action
+
+                new_labels[track_id] = {
+                    "action":      action,
+                    "next_action": next_action,
+                    "track_id":    track_id,
+                }
+
+                # ── Alert logic ────────────────────────────────────────────────
+                if self._emit_fn:
+                    if action == Action.FALLEN and w.should_alert(Action.FALLEN, 15.0):
+                        self._emit_fn(self._camera_id, "behavior", {
+                            "action":   "fallen",
+                            "track_id": track_id,
+                            "label":    f"Person #{track_id} may have fallen",
+                            "severity": "high",
+                        })
+                    elif action == Action.FIGHTING and w.should_alert(Action.FIGHTING, 10.0):
+                        self._emit_fn(self._camera_id, "behavior", {
+                            "action":   "fighting",
+                            "track_id": track_id,
+                            "label":    f"Aggressive movement #{track_id}",
+                            "severity": "high",
+                        })
+                    elif action == Action.RUNNING and w.should_alert(Action.RUNNING, 20.0):
+                        self._emit_fn(self._camera_id, "behavior", {
+                            "action":   "running",
+                            "track_id": track_id,
+                            "label":    f"Person #{track_id} running",
+                            "severity": "medium",
+                        })
+
+            with self._lock:
+                self._labels.update(new_labels)
+
+            self._prune_stale()
+
+    def _match_pose_to_tracks(self, tracks, pose_results, frame_shape) -> Dict[int, np.ndarray]:
+        """
+        Assign pose keypoints to ByteTrack IDs via best-IoU matching.
+        Returns dict: track_id → keypoints (17,3).
+        """
+        if not pose_results:
+            return {}
+
+        result: Dict[int, np.ndarray] = {}
+        used_poses = set()
+
+        for t in tracks:
+            if len(t) < 5:
+                continue
+            tb = (t[0], t[1], t[2], t[3])
+            track_id = int(t[4])
+            best_iou  = 0.0
+            best_idx  = -1
+
+            for i, (pb, _) in enumerate(pose_results):
+                if i in used_poses:
+                    continue
+                iou = _iou(tb, pb)
+                if iou > best_iou:
+                    best_iou = iou
+                    best_idx = i
+
+            if best_idx >= 0 and best_iou > 0.30:
+                result[track_id] = pose_results[best_idx][1]  # keypoints (17,3)
+                used_poses.add(best_idx)
+
+        return result
+
+    def _prune_stale(self):
+        now = time.time()
+        with self._lock:
+            stale = [tid for tid, w in self._tracks.items()
+                     if now - w.last_update > self.TRACK_TTL]
+            for tid in stale:
+                self._tracks.pop(tid, None)
+                self._labels.pop(tid, None)
+
+    def stop(self):
+        self._running = False
+
+
+# ── IoU helper ────────────────────────────────────────────────────────────────
+def _iou(a, b) -> float:
+    ax1,ay1,ax2,ay2 = a[0],a[1],a[2],a[3]
+    bx1,by1,bx2,by2 = b[0],b[1],b[2],b[3]
+    ix1 = max(ax1,bx1); iy1 = max(ay1,by1)
+    ix2 = min(ax2,bx2); iy2 = min(ay2,by2)
+    inter = max(0,ix2-ix1)*max(0,iy2-iy1)
+    ua = max(0,ax2-ax1)*max(0,ay2-ay1)
+    ub = max(0,bx2-bx1)*max(0,by2-by1)
+    return inter / (ua+ub-inter+1e-6)
+
+
+# ── Draw helper (imported by detect.py) ──────────────────────────────────────
+ACTION_COLORS = {
+    Action.STANDING:  (0,   220,  80),
+    Action.WALKING:   (0,   180, 255),
+    Action.RUNNING:   (0,   100, 255),
+    Action.CROUCHING: (60,  200, 255),
+    Action.FALLEN:    (0,     0, 255),
+    Action.RAISING:   (255, 180,   0),
+    Action.FIGHTING:  (0,    30, 255),
+    Action.UNKNOWN:   (120, 120, 120),
+}
+
+def draw_behavior(frame: np.ndarray, tracks: np.ndarray, labels: Dict[int, dict]):
+    """Overlay action labels on annotated frame."""
+    if not labels or tracks is None or len(tracks) == 0:
+        return
+    for t in tracks:
+        if len(t) < 5:
+            continue
+        tid = int(t[4])
+        info = labels.get(tid)
+        if not info:
+            continue
+        x1, y2 = int(t[0]), int(t[3])
+        action = info.get("action", "?")
+        nxt    = info.get("next_action", "?")
+        color  = ACTION_COLORS.get(action, (200, 200, 200))
+
+        label = str(label).split("???")[0].strip() if label else "unknown"
+        cv2.putText(frame, label, (x1, y2+15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)

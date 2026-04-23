@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""
+export_pose_model.py — export YOLOv8n-pose to TensorRT FP16 engine.
+
+Run once on Jetson after setup.
+Usage:
+    python export_pose_model.py
+    python export_pose_model.py --imgsz 360 640 --skip-trt   # ONNX only
+"""
+
+import argparse, os, subprocess, sys, logging
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+log = logging.getLogger("export_pose")
+
+MODELS_DIR = "models"
+os.makedirs(MODELS_DIR, exist_ok=True)
+
+
+def run(cmd: str, check=True):
+    log.info(f"$ {cmd}")
+    r = subprocess.run(cmd, shell=True)
+    if check and r.returncode != 0:
+        log.error(f"Command failed (exit {r.returncode})")
+        sys.exit(1)
+    return r.returncode == 0
+
+
+def export_pose(h: int, w: int, skip_trt: bool):
+    engine_out = os.path.join(MODELS_DIR, "yolov8n-pose.engine")
+    onnx_out   = os.path.join(MODELS_DIR, "yolov8n-pose.onnx")
+
+    if os.path.exists(engine_out) and not skip_trt:
+        log.info(f"Engine already exists: {engine_out}  (delete to re-export)")
+        return
+
+    log.info("=== Step 1: Download + export YOLOv8n-pose → ONNX ===")
+    run(
+        f'python -c "'
+        f"from ultralytics import YOLO; "
+        f"m = YOLO('yolov8n-pose.pt'); "
+        f"m.export(format='onnx', opset=17, simplify=False, dynamic=False, "
+        f"         imgsz=[{h},{w}])"
+        f'"'
+    )
+
+    # ultralytics writes yolov8n-pose.onnx next to the .pt
+    src = "yolov8n-pose.onnx"
+    if not os.path.exists(src):
+        log.error(f"ONNX not found at {src}"); sys.exit(1)
+
+    import shutil
+    shutil.copy(src, onnx_out)
+    log.info(f"✓ ONNX saved: {onnx_out}")
+
+    if skip_trt:
+        log.info("--skip-trt set — stopping at ONNX stage.")
+        return
+
+    log.info("=== Step 2: Build TensorRT FP16 engine ===")
+    run(
+        f"trtexec"
+        f"  --onnx={onnx_out}"
+        f"  --saveEngine={engine_out}"
+        f"  --fp16"
+        f"  --memPoolSize=workspace:2048"
+    )
+    log.info(f"✓ TensorRT engine saved: {engine_out}")
+
+    log.info("=== Step 3: Validate ===")
+    try:
+        import tensorrt as trt  # noqa: F401
+    except Exception as e:
+        log.warning(f"Skipping TensorRT Python validation: {e}")
+        return
+
+    run(
+        f'python -c "'
+        f"from ultralytics import YOLO; import numpy as np; "
+        f"m = YOLO('{engine_out}', task='pose'); "
+        f"r = m(np.zeros(({h},{w},3), dtype='uint8'), device='cuda:0', verbose=False); "
+        f"kps = r[0].keypoints; "
+        f"print('Pose engine OK, persons:', len(r[0].boxes), "
+        f"      'keypoints shape:', kps.data.shape if kps else 'none')"
+        f'"'
+    )
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--imgsz",    nargs=2, type=int, default=[384, 640],
+                   metavar=("H","W"))
+    p.add_argument("--skip-trt", action="store_true",
+                   help="Only export ONNX, skip trtexec (useful to test on non-Jetson)")
+    args = p.parse_args()
+    export_pose(args.imgsz[0], args.imgsz[1], args.skip_trt)
+
+
+if __name__ == "__main__":
+    main()

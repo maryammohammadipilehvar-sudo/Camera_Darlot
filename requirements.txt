@@ -1,0 +1,27 @@
+# requirements.txt — Jetson Orin (JetPack 5.x / 6.x)
+# Install order matters on Jetson — see setup.sh
+
+# Core ML
+ultralytics>=8.2.0
+onnxruntime-gpu>=1.17.0      # installed from JetPack wheel, see setup.sh
+torch>=2.1.0                 # use JetPack wheel, not PyPI
+torchvision>=0.16.0          # use JetPack wheel
+
+# Tracking
+boxmot>=10.0.43
+
+# Face
+insightface>=0.7.3
+faiss-cpu>=1.7.4             # or faiss-gpu if available for your JetPack
+
+# Audio
+tflite-runtime>=2.14.0       # from tensorflow-jetson wheel, see setup.sh
+sounddevice>=0.4.6
+
+# Alerting
+paho-mqtt>=1.6.1
+
+# Utilities
+numpy>=1.24.0
+opencv-python-headless>=4.8.0
+huggingface_hub>=0.20.0
