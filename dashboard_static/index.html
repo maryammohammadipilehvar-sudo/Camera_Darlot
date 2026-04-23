@@ -321,20 +321,91 @@ td.trunc{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
 /* ─── Modal ───────────────────────────────────────────────────────────────── */
 #modal{position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:2000;
-  display:flex;align-items:center;justify-content:center;
+  display:flex;align-items:center;justify-content:center;padding:20px;
   backdrop-filter:blur(5px);-webkit-backdrop-filter:blur(5px)}
 #modal.hidden{display:none}
-.modal-box{background:var(--bg2);border:1px solid var(--border2);
-  border-radius:6px;padding:22px;max-width:520px;width:92%;
-  max-height:72vh;overflow-y:auto;position:relative}
-#modal-close{position:absolute;top:11px;right:12px;background:none;
-  border:none;color:var(--text3);cursor:pointer;font-size:16px;
-  transition:color .2s;padding:2px 6px}
-#modal-close:hover{color:var(--text)}
-.modal-ts{font-family:var(--font-mono);font-size:10px;color:var(--text3);
-  margin-bottom:10px}
-#modal-pre{font-family:var(--font-mono);font-size:12px;color:var(--teal);
-  white-space:pre;line-height:1.65;word-break:break-all}
+
+.modal-box{background:var(--bg2);border:1px solid var(--border2);border-radius:6px;
+  width:100%;max-width:640px;max-height:86vh;display:flex;flex-direction:column;
+  overflow:hidden;position:relative;box-shadow:0 14px 40px rgba(0,0,0,.55)}
+
+.modal-sev-strip{height:4px;width:100%;background:var(--text3);flex-shrink:0;
+  transition:background .2s}
+
+.modal-head{display:flex;align-items:center;gap:10px;padding:14px 50px 10px 22px;
+  flex-shrink:0}
+.modal-sev-pill{display:inline-block;padding:2px 9px;border-radius:2px;
+  font-size:10px;font-weight:700;letter-spacing:1.5px;border:1px solid currentColor;
+  font-family:var(--font-ui)}
+.modal-eyebrow{font-family:var(--font-mono);font-size:10px;letter-spacing:1.5px;
+  color:var(--text3);text-transform:uppercase}
+
+.modal-close{position:absolute;top:14px;right:14px;background:none;border:none;
+  color:var(--text3);cursor:pointer;font-size:16px;padding:4px 8px;border-radius:var(--r);
+  transition:color .2s,background .15s,box-shadow .15s}
+.modal-close:hover{color:var(--text);background:rgba(255,255,255,.04)}
+.modal-close:focus-visible{outline:none;box-shadow:0 0 0 2px var(--accent);color:var(--text)}
+
+.modal-headline{font-family:var(--font-ui);font-size:20px;font-weight:600;
+  color:var(--text);line-height:1.25;padding:0 22px;flex-shrink:0}
+.modal-sub{font-family:var(--font-mono);font-size:11px;color:var(--text2);
+  padding:4px 22px 16px;flex-shrink:0}
+
+.modal-scroll{overflow-y:auto;padding:0 22px 4px;flex:1;min-height:0;
+  scrollbar-width:thin;scrollbar-color:var(--border2) transparent}
+.modal-scroll::-webkit-scrollbar{width:4px}
+.modal-scroll::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px}
+
+.modal-facts{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:16px}
+@media (max-width:560px){.modal-facts{grid-template-columns:repeat(2,1fr)}}
+.mfact{background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);
+  padding:8px 10px;min-width:0}
+.mfact-l{font-size:9px;letter-spacing:1.5px;color:var(--text3);font-weight:600;
+  text-transform:uppercase;margin-bottom:3px}
+.mfact-v{font-size:13px;font-weight:500;color:var(--text);overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.mfact-empty{grid-column:1/-1;color:var(--text3);font-size:11px;font-style:italic;
+  padding:6px 2px}
+
+.modal-evidence{background:var(--bg);border:1px solid var(--border);border-radius:6px;
+  aspect-ratio:16/9;display:flex;align-items:center;justify-content:center;
+  margin-bottom:16px;flex-shrink:0}
+.modal-evidence-txt{color:var(--text3);font-size:11px;letter-spacing:1.5px;
+  text-transform:uppercase}
+
+.modal-dev{margin-bottom:14px;border:1px solid var(--border);border-radius:var(--r);
+  background:var(--bg3)}
+.modal-dev summary{cursor:pointer;padding:7px 12px;font-size:11px;font-weight:500;
+  color:var(--text2);letter-spacing:.5px;list-style:none;user-select:none;
+  transition:color .2s}
+.modal-dev summary::-webkit-details-marker{display:none}
+.modal-dev summary::before{content:'▸';display:inline-block;margin-right:7px;
+  transition:transform .2s;color:var(--text3)}
+.modal-dev[open] summary::before{transform:rotate(90deg)}
+.modal-dev summary:hover{color:var(--text)}
+.modal-dev summary:focus-visible{outline:none;box-shadow:0 0 0 2px var(--accent) inset}
+.modal-copy-btn{margin:0 12px 8px}
+.modal-dev-json{font-family:var(--font-mono);font-size:11px;color:var(--teal);
+  padding:0 12px 12px;white-space:pre-wrap;word-break:break-all;line-height:1.6;
+  margin:0}
+
+.modal-footer{border-top:1px solid var(--border);padding:10px 22px 14px;flex-shrink:0;
+  background:var(--bg2)}
+.modal-kbd{font-family:var(--font-mono);font-size:9px;letter-spacing:1px;
+  color:var(--text3);text-align:center;margin-bottom:8px}
+.modal-actions{display:flex;justify-content:flex-end;gap:8px}
+
+.btn-ack,.btn-escalate{font-family:var(--font-ui);font-size:12px;font-weight:600;
+  letter-spacing:1px;padding:8px 18px;border-radius:var(--r);cursor:pointer;
+  border:1px solid currentColor;transition:background .15s,box-shadow .15s,transform .08s}
+.btn-ack{background:var(--accent);color:#04110a;border-color:var(--accent)}
+.btn-ack:hover{background:var(--accent-2);box-shadow:0 0 12px var(--accent-glow)}
+.btn-ack:active{transform:translateY(1px)}
+.btn-ack:focus-visible{outline:none;box-shadow:0 0 0 2px var(--text) inset}
+.btn-escalate{background:transparent;color:var(--yellow);border-color:var(--yellow)}
+.btn-escalate:hover{background:var(--yellow-d)}
+.btn-escalate:active{transform:translateY(1px)}
+.btn-escalate:focus-visible{outline:none;box-shadow:0 0 0 2px var(--yellow) inset}
 </style>
 </head>
 <body>
@@ -343,11 +414,34 @@ td.trunc{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 <div id="toasts"></div>
 
 <!-- Detail modal -->
-<div id="modal" class="hidden">
+<div id="modal" class="hidden" role="dialog" aria-modal="true" aria-labelledby="modal-headline">
   <div class="modal-box">
-    <button id="modal-close" title="Close">✕</button>
-    <div class="modal-ts" id="modal-ts"></div>
-    <pre id="modal-pre"></pre>
+    <div class="modal-sev-strip" id="modal-sev-strip"></div>
+    <div class="modal-head">
+      <span class="modal-sev-pill" id="modal-sev-pill">—</span>
+      <span class="modal-eyebrow" id="modal-eyebrow"></span>
+      <button id="modal-close" class="modal-close" aria-label="Close" onclick="closeModal()">✕</button>
+    </div>
+    <div class="modal-headline" id="modal-headline"></div>
+    <div class="modal-sub" id="modal-sub"></div>
+    <div class="modal-scroll">
+      <div class="modal-facts" id="modal-facts"></div>
+      <div class="modal-evidence">
+        <div class="modal-evidence-txt">No snapshot captured</div>
+      </div>
+      <details class="modal-dev">
+        <summary>Developer details</summary>
+        <button class="sb modal-copy-btn" onclick="modalCopyJson()">Copy JSON</button>
+        <pre class="modal-dev-json" id="modal-dev-json"></pre>
+      </details>
+    </div>
+    <div class="modal-footer">
+      <div class="modal-kbd">Enter · Acknowledge     Shift+E · Escalate     Esc · Close</div>
+      <div class="modal-actions">
+        <button id="btn-escalate" class="btn-escalate" onclick="modalEscalate()">⚑ Escalate</button>
+        <button id="btn-ack" class="btn-ack" onclick="modalAck()">✓ Acknowledge</button>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -777,18 +871,206 @@ function showToast(ev){
 }
 
 // ── Modal ─────────────────────────────────────────────────────────────────────
+// Audio classes that render as CRITICAL severity regardless of numeric score.
+// All other audio classes are downgraded to HIGH. Tune this list to match the
+// real-world false-positive profile — a quieter environment may warrant
+// removing 'alarm' or 'siren' if nearby traffic triggers them frequently.
+const CRITICAL_AUDIO_CLASSES = ['gunshot','scream','glass','alarm','siren'];
+
+const SEVERITY_META = {
+  critical: {label:'CRITICAL', color:'var(--red)',    bg:'var(--red-d)'},
+  high:     {label:'HIGH',     color:'var(--yellow)', bg:'var(--yellow-d)'},
+  medium:   {label:'MEDIUM',   color:'var(--blue)',   bg:'var(--blue-d)'},
+  low:      {label:'LOW',      color:'var(--teal)',   bg:'var(--teal-d)'},
+  info:     {label:'INFO',     color:'var(--text3)',  bg:'transparent'},
+};
+
 function esc(ev){
   return JSON.stringify(JSON.stringify(ev));  // double-encode for onclick attr
 }
+
+// Map event → severity key.
+//   1. detail.severity string wins if recognisable ("critical"/"high"/"medium"/"low")
+//   2. otherwise derive from kind (+ audio class for audio events)
+function severityOf(ev){
+  const det = ev.detail || {};
+  const raw = String(det.severity || '').toLowerCase();
+  if(raw === 'critical' || raw === 'high') return 'critical';
+  if(raw === 'medium') return 'high';
+  if(raw === 'low') return 'low';
+
+  const kind = ev.kind || ev.display_kind || '';
+  if(kind === 'anomaly' || kind === 'thermal') return 'critical';
+  if(kind === 'audio'){
+    const c = String(det.class || '').toLowerCase();
+    return CRITICAL_AUDIO_CLASSES.some(x => c.includes(x)) ? 'critical' : 'high';
+  }
+  if(kind === 'loitering') return 'high';
+  if(kind === 'detection') return 'medium';
+  if(kind === 'detection_summary' || kind === 'face_match') return 'low';
+  return 'info';
+}
+
+// Title-case a snake/space string (e.g. "knife_object" → "Knife Object").
+function _titleCase(s){
+  return String(s).replace(/_/g,' ').replace(/\b\w/g, c => c.toUpperCase());
+}
+
+// Build visible fact cells for the grid from the event's detail object.
+// Kind-specific rules apply; detection_summary intentionally shows COUNT/TOP
+// only (confidence/track live in Developer details for those events).
+// Max 6 cells. Null/undefined values are skipped.
+function buildFacts(ev){
+  const det = ev.detail || {};
+  const kind = ev.kind || '';
+  const facts = [];
+
+  if(kind === 'detection_summary'){
+    if(det.count != null) facts.push({label:'COUNT', value:String(det.count)});
+    if(det.classes && typeof det.classes === 'object'){
+      const top = Object.entries(det.classes)
+        .sort((a,b) => Number(b[1]) - Number(a[1]))
+        .slice(0,3)
+        .map(([k,v]) => `${v}×${_titleCase(k)}`)
+        .join(', ');
+      if(top) facts.push({label:'TOP CLASSES', value:top});
+    } else if(det.label){
+      facts.push({label:'SUMMARY', value:String(det.label)});
+    }
+    return facts;
+  }
+
+  if(det.class_name) facts.push({label:'WHAT', value:_titleCase(det.class_name)});
+  if(det.confidence != null) facts.push({label:'CONFIDENCE', value:Math.round(Number(det.confidence)*100)+'%'});
+  if(det.track_id != null) facts.push({label:'TRACK', value:'#'+det.track_id});
+  if(det.zone) facts.push({label:'ZONE', value:String(det.zone)});
+  if(det.dwell_s != null) facts.push({label:'DWELL', value:Math.round(Number(det.dwell_s))+'s'});
+  if(det.class && kind === 'audio') facts.push({label:'SOUND', value:_titleCase(det.class)});
+  if(det.score != null) facts.push({label:'SCORE', value:Number(det.score).toFixed(2)});
+  if(det.temp_c != null) facts.push({label:'TEMP', value:Number(det.temp_c).toFixed(1)+'°C'});
+
+  return facts.slice(0, 6);
+}
+
+// Element previously focused before modal opened — restored on close (a11y).
+let _modalPrevFocus = null;
+// Currently-displayed event, used by action handlers.
+let _modalCurrentEv = null;
+
+// Small inline toast helper — action feedback only. Distinct from showToast(),
+// which is tailored to live event cards. Uses the existing .toast CSS.
+function _modalToast(msg, color){
+  const t = document.createElement('div');
+  t.className = 'toast';
+  t.innerHTML =
+    `<div class="t-bar" style="background:${color}"></div>` +
+    `<div class="t-body"><div class="t-det">${msg}</div></div>`;
+  const host = document.getElementById('toasts');
+  if(!host) return;
+  host.appendChild(t);
+  requestAnimationFrame(()=>requestAnimationFrame(()=>t.classList.add('show')));
+  setTimeout(()=>{t.classList.remove('show'); setTimeout(()=>t.remove(), 400);}, 3200);
+}
+
+// HTML-escape for text that will be injected via innerHTML. The fact-grid
+// values come from backend JSON, not user input, but defence-in-depth is cheap.
+function _htmlEsc(s){
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[c]));
+}
+
 function openModal(evStr){
-  const ev=typeof evStr==='string'?JSON.parse(evStr):evStr;
-  let det=ev.detail;
-  if(typeof det==='string')det=tryParse(det);
-  const obj={...ev,detail:det};
-  document.getElementById('modal-ts').textContent=
-    'Event #'+ev.id+' — '+fmtTs(ev.ts);
-  document.getElementById('modal-pre').textContent=JSON.stringify(obj,null,2);
-  document.getElementById('modal').classList.remove('hidden');
+  const ev = typeof evStr === 'string' ? JSON.parse(evStr) : evStr;
+  let det = ev.detail;
+  if(typeof det === 'string') det = tryParse(det);
+  const obj = {...ev, detail:det};
+  _modalCurrentEv = obj;
+
+  const sev = severityOf(obj);
+  const meta = SEVERITY_META[sev] || SEVERITY_META.info;
+
+  const facts = buildFacts(obj);
+  const factsHtml = facts.length
+    ? facts.map(f =>
+        `<div class="mfact"><div class="mfact-l">${_htmlEsc(f.label)}</div>` +
+        `<div class="mfact-v" title="${_htmlEsc(f.value)}">${_htmlEsc(f.value)}</div></div>`
+      ).join('')
+    : '<div class="mfact-empty">No structured facts — see developer details below.</div>';
+
+  const cam = obj.display_camera || obj.camera || '—';
+  const timeTxt = obj.display_time || fmtTs(obj.ts);
+  const headline = obj.display_summary || summary(obj) || (obj.kind || 'Event');
+
+  document.getElementById('modal-sev-strip').style.background = meta.color;
+  const pill = document.getElementById('modal-sev-pill');
+  pill.textContent = meta.label;
+  pill.style.color = meta.color;
+  pill.style.borderColor = meta.color;
+  pill.style.background = meta.bg;
+  document.getElementById('modal-eyebrow').textContent =
+    'Event · #' + (obj.id != null ? obj.id : '?');
+  document.getElementById('modal-headline').textContent = headline;
+  document.getElementById('modal-sub').textContent =
+    'Camera ' + cam + '   ·   ' + timeTxt;
+  document.getElementById('modal-facts').innerHTML = factsHtml;
+  document.getElementById('modal-dev-json').textContent = JSON.stringify(obj, null, 2);
+
+  // Collapse developer details on each open so repeat-clicks don't preserve state.
+  const dev = document.querySelector('.modal-dev');
+  if(dev) dev.removeAttribute('open');
+
+  const m = document.getElementById('modal');
+  _modalPrevFocus = document.activeElement;
+  m.classList.remove('hidden');
+  // Focus the primary action so Enter naturally acknowledges (no custom handler needed).
+  setTimeout(() => {
+    const b = document.getElementById('btn-ack');
+    if(b) b.focus();
+  }, 0);
+}
+
+// Silent dismiss — does NOT log an action. Used by ✕, Escape, click-outside.
+// Acknowledge/Escalate call this after their own log+toast.
+function closeModal(){
+  const m = document.getElementById('modal');
+  if(!m || m.classList.contains('hidden')) return;
+  m.classList.add('hidden');
+  if(_modalPrevFocus && typeof _modalPrevFocus.focus === 'function'){
+    try{ _modalPrevFocus.focus(); } catch(_){}
+  }
+  _modalPrevFocus = null;
+  _modalCurrentEv = null;
+}
+
+function modalAck(){
+  const ev = _modalCurrentEv;
+  if(!ev){ closeModal(); return; }
+  console.log('action=ack', {id:ev.id, kind:ev.kind, ts:ev.ts});
+  _modalToast('Acknowledged · Event #' + (ev.id != null ? ev.id : '?'), 'var(--accent)');
+  closeModal();
+}
+
+function modalEscalate(){
+  const ev = _modalCurrentEv;
+  if(!ev){ closeModal(); return; }
+  console.log('action=escalate', {id:ev.id, kind:ev.kind, ts:ev.ts});
+  _modalToast('Escalated · supervisor will be notified (stub)', 'var(--yellow)');
+  closeModal();
+}
+
+function modalCopyJson(){
+  const ev = _modalCurrentEv;
+  if(!ev) return;
+  const txt = JSON.stringify(ev, null, 2);
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(txt).then(
+      () => _modalToast('Copied JSON to clipboard', 'var(--text2)'),
+      () => _modalToast('Copy failed', 'var(--red)')
+    );
+  } else {
+    _modalToast('Clipboard unavailable in this browser', 'var(--red)');
+  }
 }
 
 // ── Stream ────────────────────────────────────────────────────────────────────
@@ -849,10 +1131,10 @@ function initControls(){
     bPause.title=S.paused?'Resume live feed':'Pause live feed';
   };
   document.getElementById('btn-clear').onclick=()=>{S.feed=[];renderFeed()};
-  document.getElementById('modal-close').onclick=()=>
-    document.getElementById('modal').classList.add('hidden');
+  // Modal-close button uses inline onclick="closeModal()" in HTML.
+  // Overlay click-outside also silently dismisses (no action logged).
   document.getElementById('modal').onclick=function(e){
-    if(e.target===this)this.classList.add('hidden');
+    if(e.target===this) closeModal();
   };
   document.getElementById('btn-filter').onclick=()=>{
     S.filters.kind =document.getElementById('f-kind').value;
@@ -867,7 +1149,24 @@ function initControls(){
   };
   document.getElementById('btn-export').onclick=exportCSV;
   document.addEventListener('keydown',e=>{
-    if(e.key==='Escape')document.getElementById('modal').classList.add('hidden');
+    const m = document.getElementById('modal');
+    const modalOpen = m && !m.classList.contains('hidden');
+    if(e.key === 'Escape'){ if(modalOpen) closeModal(); return; }
+    if(!modalOpen) return;
+    // Tab focus trap — keep keyboard users cycled within the modal.
+    if(e.key === 'Tab'){
+      const focusable = m.querySelectorAll('button, summary, [tabindex]:not([tabindex="-1"])');
+      if(!focusable.length) return;
+      const first = focusable[0], last = focusable[focusable.length - 1];
+      if(e.shiftKey && document.activeElement === first){ e.preventDefault(); last.focus(); }
+      else if(!e.shiftKey && document.activeElement === last){ e.preventDefault(); first.focus(); }
+      return;
+    }
+    // Shift+E → Escalate (global shortcut while modal is open).
+    if(e.shiftKey && (e.key === 'E' || e.key === 'e')){ e.preventDefault(); modalEscalate(); }
+    // Enter is not intercepted — btn-ack is focused on open, so native
+    // button activation handles acknowledgment. This also lets the
+    // <details> summary toggle via Enter when user tabs to it.
   });
 }
 
