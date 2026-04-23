@@ -8,6 +8,8 @@ backups/
 upgrade/
 *.pt
 *.onnx
+*.engine
+*.log
 _old_backups/
 *.bak
 *.bak_*
