@@ -36,3 +36,29 @@ sufficient context to pick up in a future session.
 - Works only when the venv is activated at call time. In other contexts (a tool running the script with a different PATH, `systemd-run`, cron) this could resolve to a different Python or fail.
 - Fix: switch to `sys.executable` (the absolute path to the same Python running the parent script) or explicit `python3`.
 - Low urgency; expected invocation is always `source .venv/bin/activate && python export_pose_model.py`.
+
+### Daemon threads use `while True:` without shared stop-event (HIGH)
+
+- Observed Session 2: `systemctl stop security_pipeline` ends in "failed" (SIGKILL after grace-period) rather than clean "inactive".
+- Root cause: `thermal_monitor` (`detect.py:229`) and `_mqtt_worker` (at least) use `while True:` loops that don't observe the main loop's `running` flag. On SIGTERM, main exits cleanly, but daemon threads continue until systemd's SIGKILL.
+- Related to AUDIT Risk #9 (`_mqtt_worker` initial-connect loop has no shutdown visibility either).
+- Fix: introduce a shared `threading.Event` stop flag; each background `while`-loop checks it (e.g., `while not stop.is_set():`). Drain alert queue on shutdown.
+- High urgency — clean shutdown is a prerequisite for reliable systemd restarts and for not losing in-flight alerts.
+
+### SIGTERM handler non-responsive within systemd grace period (MEDIUM)
+
+- Observed Session 2 during service stop: `security_pipeline` shows "failed" post-stop because systemd SIGKILL'd it after SIGTERM timed out.
+- Signal handler at `signal.signal(SIGINT, SIGTERM → _stop)` flips `running=False`, but by the time any long-running call in the main loop (YOLO inference, `cam.read()` blocking on RTSP, `tracker.update`) returns, grace period may have elapsed.
+- Investigation needed: what's the systemd default `TimeoutStopSec` for this unit, and which call in the main loop is holding the process past that limit?
+- Likely related to the daemon-thread item above — full fix may be combined (stop-event + shorter blocking operations in main loop + raise systemd `TimeoutStopSec` if needed).
+- Medium urgency — "failed" exit status pollutes `systemctl status` and complicates ops runbooks.
+
+### Silent-degradation audit of remaining `except Exception` blocks in detect.py (MEDIUM)
+
+- After Session 2's Fix A treatment of `_init_bytetrack`, the rest of detect.py still contains bare `except Exception` / `except Exception: pass` patterns that silently swallow failures.
+- Known sites to review:
+  - `detect.py:711-712` — behavior analyzer initialization (`log.warning` only, no traceback)
+  - `detect.py:907-909` — `try/except Exception: pass` wrapping `draw_behavior` (the bug Fix B removed was hiding inside this very block)
+  - Likely more in the main loop, annotate/stream path, and `emit_alert` fallthrough
+- Apply the ByteTrack treatment: specific catches where possible; `log.error`/`log.exception` with greppable prefixes (e.g., "BEHAVIOR DISABLED", "ANNOTATE ERROR") for fail-open cases where graceful degradation is intentional.
+- Medium urgency — these don't actively break anything today, but they're the pattern that hid Fix A for days.
