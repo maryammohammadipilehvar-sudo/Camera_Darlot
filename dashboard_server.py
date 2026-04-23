@@ -304,7 +304,7 @@ def _on_message(client, userdata, msg):
 
 
 def _mqtt_thread():
-    client = mqtt.Client()
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
     client.on_connect    = _on_connect
     client.on_disconnect = _on_disconnect
     client.on_message    = _on_message

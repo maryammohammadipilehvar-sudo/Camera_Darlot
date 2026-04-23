@@ -255,7 +255,7 @@ def _mqtt_worker(cfg: dict):
     global _alert_total
     import paho.mqtt.client as mqtt
 
-    client = mqtt.Client(client_id="sentinel_pipeline", protocol=mqtt.MQTTv311)
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1, client_id="sentinel_pipeline", protocol=mqtt.MQTTv311)
     client.reconnect_delay_set(min_delay=1, max_delay=30)
 
     def _on_connect(c, ud, flags, rc):

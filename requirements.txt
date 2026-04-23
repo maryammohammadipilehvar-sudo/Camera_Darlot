@@ -19,7 +19,8 @@ tflite-runtime>=2.14.0       # from tensorflow-jetson wheel, see setup.sh
 sounddevice>=0.4.6
 
 # Alerting
-paho-mqtt>=1.6.1
+# Pinned to v2; code uses mqtt.CallbackAPIVersion.VERSION1 for v1 callback signatures.
+paho-mqtt>=2.1.0,<3.0
 
 # Utilities
 numpy>=1.24.0
