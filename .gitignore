@@ -8,3 +8,8 @@ backups/
 upgrade/
 *.pt
 *.onnx
+_old_backups/
+*.bak
+*.bak_*
+*.before_*
+*.auto_fix_*
