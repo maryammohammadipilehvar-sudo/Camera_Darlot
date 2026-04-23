@@ -186,12 +186,13 @@ Ranked highest-to-lowest. Line numbers are where the defect lives.
 
 ### HIGH
 
-**2. `NameError` inside `behavior.draw_behavior` silently suppresses the overlay.** — `behavior.py:481`.
+**2. `NameError` inside `behavior.draw_behavior` silently suppresses the overlay.** — `behavior.py:481`. **RESOLVED 2026-04-23, `94cb671`.**
 ```
 label = str(label).split("???")[0].strip() if label else "unknown"
 ```
 `label` is never bound in this function; `info`, `action`, `nxt` are. This raises `NameError` on every call with non-empty `labels`. In `detect.py:902–905` the call is wrapped in `try/except Exception: pass`, so behavior labels never render — silently.
 **Fix:** replace `label = ...` with `label = str(action).split("???")[0].strip() if action else "unknown"` (or drop the line; `action` is already cleaned upstream).
+**Resolution:** Session 2. Chose Option Y (full rename): both line 481 and line 482 now use `action`, eliminating the vestigial `label` variable entirely. Defensive `split("???")`/`strip`/`else "unknown"` preserved as belt-and-suspenders per user decision. MJPEG overlay rendering not visually verified in terminal session — follow-up unit test candidate per §6 #6.
 
 **3. Zone loitering collapses all untracked objects into `track_id=0`.** — `detect.py:865`.
 ```
