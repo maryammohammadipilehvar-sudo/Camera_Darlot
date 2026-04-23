@@ -4,6 +4,38 @@ Deferred work captured from audits and verification runs. Items here are
 intentionally not blocking the current change; each entry notes urgency and
 sufficient context to pick up in a future session.
 
+### Build real remote notification channel (HIGH)
+
+The pipeline emits MQTT to `security/alerts` but no verified subscriber
+exists. For an autonomous deployment this is THE critical gap: detection
+without notification means the system tells no one.
+
+Recommended starting channel: **ntfy.sh** (free, self-hostable, 30-minute
+setup, phone push via app) **or** Telegram bot (free, supports rich media,
+trusted platform, 1-2 hour setup).
+
+NOT starting with: SMS/voice (Twilio cost + complexity), email (spam-filter
+unreliability), mobile app (too much work).
+
+This is the Session 4 candidate.
+
+### Revisit modal action buttons for autonomous-first persona (MEDIUM)
+
+Session 3 designed Acknowledge/Escalate around a security-guard workflow
+that doesn't exist in the real product. The dashboard is an admin review
+console, not a live monitoring surface. Candidate replacement actions:
+"Mark as false alarm" (ML feedback), "Acknowledge" (admin review flag),
+possibly remove Escalate entirely. Wait until the notification channel is
+in place and real admin workflow is observed before redesigning.
+
+### Multi-site architecture (MEDIUM)
+
+Current system is single-camera, single-site. Real deployment target is
+multi-site warehouses, which implies per-site config (cameras, contacts,
+timezones), site-scoped admin access, and notification routing by site.
+Not blocking current work, but every design decision from here should
+ask "does this scale to 10 sites with different customers?"
+
 ### Migrate MQTT callbacks to paho CallbackAPIVersion.VERSION2
 
 - Current state: using VERSION1 compat (paho 2.x deprecation warning)
