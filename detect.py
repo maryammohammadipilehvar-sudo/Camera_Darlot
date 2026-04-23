@@ -334,7 +334,11 @@ def load_yolo(path: str):
 # ─────────────────────────── BYTETRACK ────────────────────────────────────────
 def _init_bytetrack():
     try:
-        from boxmot import ByteTrack
+        from boxmot.trackers.bytetrack.bytetrack import ByteTrack
+    except ImportError as e:
+        log.error(f"TRACKING DISABLED — ByteTrack import failed: {e!r}")
+        return None
+    try:
         tracker = ByteTrack(
             track_thresh=0.45,
             match_thresh=0.8,
@@ -343,8 +347,8 @@ def _init_bytetrack():
         )
         log.info("ByteTrack loaded")
         return tracker
-    except Exception as e:
-        log.warning(f"ByteTrack unavailable ({e}) — tracking disabled")
+    except Exception:
+        log.exception("TRACKING DISABLED — ByteTrack construction failed")
         return None
 
 

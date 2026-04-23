@@ -8,7 +8,9 @@ torch>=2.1.0                 # use JetPack wheel, not PyPI
 torchvision>=0.16.0          # use JetPack wheel
 
 # Tracking
-boxmot>=10.0.43
+# pinned: newer versions dropped flat ByteTrack re-export;
+#  see detect.py _init_bytetrack if upgrading
+boxmot>=10.0.43,<18.1
 
 # Face
 insightface>=0.7.3
