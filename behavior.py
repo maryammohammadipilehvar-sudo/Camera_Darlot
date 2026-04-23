@@ -478,6 +478,6 @@ def draw_behavior(frame: np.ndarray, tracks: np.ndarray, labels: Dict[int, dict]
         nxt    = info.get("next_action", "?")
         color  = ACTION_COLORS.get(action, (200, 200, 200))
 
-        label = str(label).split("???")[0].strip() if label else "unknown"
-        cv2.putText(frame, label, (x1, y2+15),
+        action = str(action).split("???")[0].strip() if action else "unknown"
+        cv2.putText(frame, action, (x1, y2+15),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
