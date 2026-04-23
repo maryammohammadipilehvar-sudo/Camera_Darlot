@@ -94,3 +94,49 @@ ask "does this scale to 10 sites with different customers?"
   - Likely more in the main loop, annotate/stream path, and `emit_alert` fallthrough
 - Apply the ByteTrack treatment: specific catches where possible; `log.error`/`log.exception` with greppable prefixes (e.g., "BEHAVIOR DISABLED", "ANNOTATE ERROR") for fail-open cases where graceful degradation is intentional.
 - Medium urgency — these don't actively break anything today, but they're the pattern that hid Fix A for days.
+
+### Capture event-time frame snapshot for modal evidence (MEDIUM)
+
+Session 3 modal renders a placeholder ("No snapshot captured") because
+the backend doesn't persist frames at event-emit time. Real work:
+
+- Pipeline side (`detect.py`): on `emit_alert`, encode the current
+  annotated frame to JPEG and write to `snapshots/<event_id>.jpg`
+  (or a ring buffer keyed by ID). Disk-budget aware — cap size, prune
+  oldest when over budget.
+- Dashboard side (`dashboard_server.py`): new route `GET
+  /api/events/{id}/snapshot` returns the JPEG, 404s if absent.
+- Frontend (`dashboard_static/index.html`): modal evidence block
+  swaps `<img src="/api/events/{id}/snapshot" onerror=fallback>`;
+  current placeholder becomes the `onerror` fallback.
+
+Open design questions: JPEG quality vs storage budget, whether to
+store the raw frame or the annotated one, whether snapshots are
+per-event or per-track. Defer until after notification channel lands.
+
+### Add `Cache-Control: no-cache` to dashboard static responses (LOW)
+
+`dashboard_server.py:452-457` serves `index.html` via
+`HTMLResponse(read_text(...))` with no cache-control headers. Browser
+caching bites during iteration — hard-reload required to see edits.
+
+Fix: one-line addition at the response headers around lines 454-456:
+`HTMLResponse(html.read_text(...), headers={"Cache-Control": "no-cache"})`.
+Same treatment for any future static routes. Low urgency — a dev
+inconvenience, not a production issue.
+
+### Silent-degradation audit of `dashboard_server.py` except Exception blocks (MEDIUM)
+
+Parallel to the `detect.py` silent-degradation audit above. Known
+sites in `dashboard_server.py`:
+
+- `_on_message` (line ~302-303): `except Exception as e: log.warning("MQTT parse error...")` — swallows everything from JSON decode errors to DB insert failures with the same generic log.
+- `broadcast` (line ~241-247): appends failed clients to `dead` and drops them without distinguishing ConnectionClosed (expected) from actual send errors (worth logging).
+- `proxy_stream._gen` (line ~343-369): `except Exception as e: log.debug(...)` — debug-level is invisible in production log config; a dead stream proxy leaves the dashboard showing "connecting…" forever with no ERROR line.
+- `_mqtt_thread` retry loop (line ~311-317): similar to detect.py's `_mqtt_worker` — catches all, no differentiation between "broker down" and "protocol mismatch."
+
+Apply the same ByteTrack treatment: specific catches where possible;
+loud, greppable log prefixes ("MQTT PARSE", "WS BROADCAST",
+"STREAM PROXY", "DASHBOARD MQTT") on failures that matter. Medium
+urgency — same rationale as the detect.py item: these don't break
+anything today, but they're where the next silent outage will hide.
