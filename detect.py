@@ -16,9 +16,10 @@ Changes from v1:
   - Separate MJPEG annotate queue to reduce main-loop latency
 """
 
-import os, time, signal, logging, threading, json, queue, collections, http.server
+import os, time, signal, logging, threading, json, queue, collections, http.server, itertools
 
 import re
+from pathlib import Path
 
 def _clean_behavior_label(v):
     try:
@@ -107,6 +108,13 @@ CFG = {
     "watchlist_meta":   "watchlist_meta.json",
     "thermal_warn_c":   70.0,
     "thermal_crit_c":   80.0,
+
+    # Snapshot capture (event-time frame retention for dashboard/Telegram)
+    "snapshot_enabled": True,
+    "snapshot_dir":     "~/.local/share/darlot/snapshots",
+    "snapshot_quality": 85,       # JPEG quality; evidence setting, not MJPEG
+    "snapshot_queue":   16,       # drop-newest on overflow
+    "snapshot_keep":    1000,     # prune oldest by mtime when over cap
 }
 
 ALLOWED_CLASSES = {0, 2, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23}
@@ -131,6 +139,11 @@ _health = {
     "behavior_ready": False,
     "uptime_s":       0,
     "start_ts":       time.time(),
+    # Snapshot capture observability (also updated live in /health handler)
+    "snapshot_count":            0,
+    "snapshot_errors":           0,
+    "snapshot_queue_depth":      0,
+    "snapshot_last_write_s_ago": None,
 }
 _health_lock = threading.Lock()
 
@@ -138,6 +151,168 @@ def _hset(**kw):
     with _health_lock:
         _health.update(kw)
         _health["uptime_s"] = int(time.time() - _health["start_ts"])
+
+
+# ─────────────────────────── SNAPSHOT CAPTURE ─────────────────────────────────
+# Monotonic per-alert id. Unique within a single pipeline run; filenames are
+# prefixed with _snapshot_start_epoch so restarts never overwrite evidence.
+_event_counter      = itertools.count(1)
+_event_counter_lock = threading.Lock()
+
+# Queue entries: (target_path: Path, frame: np.ndarray, enqueue_ts: float).
+_snapshot_q: "queue.Queue" = queue.Queue(maxsize=CFG["snapshot_queue"])
+
+# Latest annotated frame, published by the main loop after draw_hud each
+# iteration. Read by _snapshot_enqueue. Single-assignment of a numpy array
+# reference is atomic under the CPython GIL; consumers .copy() defensively.
+_snapshot_frame = None
+
+_snapshot_dir: Path       = Path(os.path.expanduser(str(CFG["snapshot_dir"])))
+_snapshot_start_epoch     = int(time.time())
+_snapshot_count           = 0
+_snapshot_errors          = 0
+_snapshot_last_write_ts   = 0.0
+_snapshot_nonmain_seen: set = set()
+
+
+def _next_event_id() -> int:
+    """Return the next monotonic event id. Thread-safe."""
+    with _event_counter_lock:
+        return next(_event_counter)
+
+
+def _setup_snapshot_dir(cfg: dict) -> bool:
+    """Create the snapshot directory if missing. Degrades on failure.
+
+    Args:
+        cfg: pipeline config dict; mutated to set ``snapshot_enabled=False``
+            if the directory cannot be created.
+
+    Returns:
+        True if the directory is ready; False if snapshots are disabled.
+    """
+    global _snapshot_dir
+    path = Path(os.path.expanduser(str(cfg["snapshot_dir"])))
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        _snapshot_dir = path
+        log.info(
+            "SNAPSHOT dir ready: %s (start_epoch=%d, keep=%d, q=%d)",
+            path, _snapshot_start_epoch,
+            cfg["snapshot_keep"], cfg["snapshot_queue"],
+        )
+        return True
+    except Exception as e:
+        log.error("SNAPSHOT dir create failed (%s): snapshots disabled", e)
+        cfg["snapshot_enabled"] = False
+        return False
+
+
+def _snapshot_enqueue(event_id: int) -> "str | None":
+    """Publish the current annotated frame to the snapshot writer queue.
+
+    Non-blocking. Returns the expected file path (the writer may not have
+    written it yet) or None when snapshots are disabled, no frame is
+    available, or the queue is full.
+
+    Args:
+        event_id: monotonic id assigned by ``_next_event_id``.
+
+    Returns:
+        The expected JPEG path as a string, or None on any degraded path.
+    """
+    if not CFG.get("snapshot_enabled", True):
+        return None
+    frame = _snapshot_frame
+    if frame is None:
+        return None  # main loop hasn't produced its first frame yet
+
+    name = threading.current_thread().name
+    if name != "MainThread" and name not in _snapshot_nonmain_seen:
+        _snapshot_nonmain_seen.add(name)
+        log.info(
+            "SNAPSHOT NOTE: first enqueue from non-main thread=%s "
+            "(will use most recent main-loop frame — may be slightly stale)",
+            name,
+        )
+
+    try:
+        frame_copy = frame.copy()
+    except Exception as e:
+        log.warning("SNAPSHOT frame copy failed for event=%d: %s", event_id, e)
+        return None
+
+    target = _snapshot_dir / f"{_snapshot_start_epoch}_{event_id}.jpg"
+    try:
+        _snapshot_q.put_nowait((target, frame_copy, time.time()))
+    except queue.Full:
+        log.warning(
+            "SNAPSHOT queue full — dropped event=%d depth=%d",
+            event_id, _snapshot_q.qsize(),
+        )
+        return None
+    return str(target)
+
+
+def _snapshot_prune(directory: Path, keep: int) -> None:
+    """Delete oldest files by mtime until at most ``keep`` remain."""
+    try:
+        files = [
+            (f.stat().st_mtime, f)
+            for f in directory.iterdir()
+            if f.is_file() and f.suffix == ".jpg"
+        ]
+        if len(files) <= keep:
+            return
+        files.sort(key=lambda x: x[0])
+        excess = files[: len(files) - keep]
+        for _mtime, path in excess:
+            try:
+                path.unlink()
+            except Exception as e:
+                log.warning("SNAPSHOT prune failed for %s: %s", path, e)
+    except Exception as e:
+        log.warning("SNAPSHOT prune listing failed: %s", e)
+
+
+def _snapshot_writer(cfg: dict) -> None:
+    """Background thread — write queued snapshots to disk, prune over cap."""
+    global _snapshot_count, _snapshot_errors, _snapshot_last_write_ts
+    log.info("SNAPSHOT writer thread started")
+    keep = cfg["snapshot_keep"]
+    quality = cfg["snapshot_quality"]
+    while True:
+        try:
+            item = _snapshot_q.get(timeout=1.0)
+        except queue.Empty:
+            continue
+        if item is None:  # shutdown sentinel — not currently used, reserved
+            break
+        target, frame, _enq_ts = item
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            ok = cv2.imwrite(str(target), frame,
+                             [cv2.IMWRITE_JPEG_QUALITY, quality])
+            if not ok:
+                raise IOError(f"cv2.imwrite returned False for {target}")
+            _snapshot_count += 1
+            _snapshot_last_write_ts = time.time()
+            _hset(snapshot_count=_snapshot_count)
+            _snapshot_prune(_snapshot_dir, keep)
+        except Exception as e:
+            _snapshot_errors += 1
+            _hset(snapshot_errors=_snapshot_errors)
+            log.error("SNAPSHOT write failed: %s err=%s", target, e)
+
+
+def start_snapshot_writer(cfg: dict) -> None:
+    """Spawn the snapshot writer thread if snapshots are enabled."""
+    if not cfg.get("snapshot_enabled", True):
+        log.info("SNAPSHOT disabled — writer thread not started")
+        return
+    threading.Thread(
+        target=_snapshot_writer, args=(cfg,), daemon=True, name="snapshot",
+    ).start()
 
 
 # ─────────────────────────── FRAME BUS ────────────────────────────────────────
@@ -198,6 +373,12 @@ class _HealthHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             with _health_lock:
+                # Live fields computed on read so the values don't go stale.
+                _health["snapshot_queue_depth"] = _snapshot_q.qsize()
+                _health["snapshot_last_write_s_ago"] = (
+                    int(time.time() - _snapshot_last_write_ts)
+                    if _snapshot_last_write_ts > 0 else None
+                )
                 body = json.dumps(_health, indent=2).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -309,6 +490,9 @@ def _mqtt_worker(cfg: dict):
 
 
 def emit_alert(camera_id: str, kind: str, detail: dict):
+    event_id = _next_event_id()
+    # Phase 4: best-effort snapshot capture. Never blocks; degrades silently.
+    _snapshot_enqueue(event_id)
     payload = {
         "camera":   camera_id,
         "kind":     kind,
@@ -316,6 +500,7 @@ def emit_alert(camera_id: str, kind: str, detail: dict):
         "label":    detail.get("label", kind),
         "severity": detail.get("severity", "low"),
         **detail,
+        "event_id": event_id,  # placed after **detail so callers can't clobber
     }
     try:
         _alert_q.put_nowait(payload)
@@ -698,6 +883,8 @@ def run(cfg: dict):
     start_mjpeg(cfg["mjpeg_port"])
     start_health(cfg["health_port"])
     start_thermal_monitor(cfg)
+    _setup_snapshot_dir(cfg)
+    start_snapshot_writer(cfg)
 
     # ── Load models ────────────────────────────────────────────────────────────
     yolo      = load_yolo(cfg["yolo_engine"])
@@ -913,6 +1100,11 @@ def run(cfg: dict):
             draw_faces(vis, last_faces, last_labels)
             draw_anomaly(vis, last_anomaly)
             draw_hud(vis, fps, len(last_tracks), _health.get("thermal_c", 0.0))
+
+            # Publish the fully-annotated frame for snapshot capture.
+            # Atomic reference rebind under the GIL; consumers .copy() before use.
+            global _snapshot_frame
+            _snapshot_frame = vis
 
             ok, jpg = cv2.imencode(
                 ".jpg", vis,
