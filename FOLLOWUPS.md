@@ -140,3 +140,74 @@ loud, greppable log prefixes ("MQTT PARSE", "WS BROADCAST",
 "STREAM PROXY", "DASHBOARD MQTT") on failures that matter. Medium
 urgency — same rationale as the detect.py item: these don't break
 anything today, but they're where the next silent outage will hide.
+
+### Alert fatigue — dedup, per-kind cooldowns, quiet hours (HIGH)
+
+Session 4 Phase 5 foreground test (2026-04-24, 120s) delivered ~24
+Telegram messages, roughly 6 of which were repeat "person detected"
+alerts for the same two people standing in frame. Under the current
+threshold (CRITICAL/HIGH/MEDIUM — HIGH includes person-class
+detections via the JS-parity severity upgrade), this will not scale
+to a real deployment.
+
+Required work:
+
+- **Audit `CFG["alert_cooldown_sec"]` (currently 30.0).** Is it
+  actually applied in the detection/loitering emit paths? Is it
+  track-aware (per track_id) or global? Grep for references;
+  verify behavior against repeat-emit observed in the Phase 5
+  test.
+- **Per-track dedup for detection events.** Track_id-keyed cooldown:
+  don't re-alert for the same track within N seconds. The existing
+  `active_objects` dict around `detect.py:720` looks structurally
+  right — needs verification that it actually gates notification,
+  not just MQTT publication.
+- **Per-kind cooldowns.** A gunshot and a person-detection should
+  have independent cooldowns. Currently a single scalar.
+- **Quiet-hours gate.** Operator-configurable window where MEDIUM
+  and below are suppressed (CRITICAL always shipping). Off by
+  default; opt-in per site.
+- Consider a "burst digest" for summary-kind events: N alerts in
+  T seconds collapse into one "5 person-detections in 60s" message.
+
+Product impact: without this, Telegram notifications become noise
+and admins turn them off — defeating the whole Session 4 build-out.
+Session 5 candidate, probably the highest-value next task.
+
+### Behavior classifier mislabels standing as sitting (MEDIUM)
+
+Session 4 Phase 5 foreground test showed the YOLOv8-pose + behavior
+classifier labeling a clearly-standing person as "sitting" across
+multiple frames. Model-quality issue, not pipeline wiring.
+
+Overlaps with AUDIT Risk #5 (duplicate "sitting" rule blocks in
+`behavior.py:167-177` with different thresholds — the loose block
+is unreachable today but the strict block's thresholds may also be
+too loose). Start there: tighten the torso-ratio / knee-hip-gap
+thresholds on the strict rule, or replace rule-based with a proper
+classifier head.
+
+Also: `"sitting"` is not a member of the `Action` enum — the string
+leaks through and downstream Markov `_TRANSITIONS` and alert logic
+fall through to `UNKNOWN`. Either add `Action.SITTING` or fold
+sitting into the existing `CROUCHING` action.
+
+Requires separate investigation (threshold sweep, possibly
+retraining). Not suitable for a single short session.
+
+### Debug overlay leak in behavior.py / draw_behavior (LOW)
+
+Session 4 Phase 5 Telegram snapshots show raw Python dict text
+drawn on every annotated frame, e.g.:
+
+    {'action': 'sitting', 'next_action': 'unknown', 'track_id': 4}
+
+Appears to be forgotten debug instrumentation inside
+`behavior.py`'s `draw_behavior` (or one of its helpers). Not a
+Phase 5 regression — behavior of this function didn't change in
+Session 4 — just made newly visible because we're now shipping
+annotated frames to Telegram as evidence.
+
+Fix: find the raw-dict draw call and either remove it or put it
+behind a `cfg["behavior_debug_overlay"] = False` toggle (per
+CLAUDE.md #13).  Small, self-contained, high-visual-impact change.

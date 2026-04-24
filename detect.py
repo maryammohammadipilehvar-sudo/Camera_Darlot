@@ -115,6 +115,13 @@ CFG = {
     "snapshot_quality": 85,       # JPEG quality; evidence setting, not MJPEG
     "snapshot_queue":   16,       # drop-newest on overflow
     "snapshot_keep":    1000,     # prune oldest by mtime when over cap
+
+    # Site identity (Operator must edit per deployment.)
+    "site_name":        "darlot-default",
+
+    # Telegram notifier
+    "notifier_enabled": True,     # set False to disable push alerts at startup
+    "notifier_queue":   100,      # detect.py-side queue for notify jobs
 }
 
 ALLOWED_CLASSES = {0, 2, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23}
@@ -126,6 +133,24 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
 log = logging.getLogger("pipeline")
+
+
+# ─────────────────────────── NOTIFIER MODULE ──────────────────────────────────
+# Import here (after log is configured) so a credentials misconfiguration
+# degrades gracefully: log.error, continue without Telegram. MQTT, dashboard,
+# snapshots, and detection keep running. /health surfaces the failure reason
+# via telegram_last_error for operators to diagnose.
+try:
+    import telegram_notifier
+    _notifier_module_error: "str | None" = None
+except Exception as e:
+    _notifier_module_error = f"{type(e).__name__}: {e}"
+    log.error(
+        "NOTIFIER module unavailable (%s) — Telegram disabled, pipeline continues",
+        e,
+    )
+    telegram_notifier = None  # type: ignore[assignment]
+
 
 # ─────────────────────────── SHARED STATE ─────────────────────────────────────
 _health = {
@@ -144,6 +169,13 @@ _health = {
     "snapshot_errors":           0,
     "snapshot_queue_depth":      0,
     "snapshot_last_write_s_ago": None,
+    # Telegram notifier observability (also updated live in /health handler)
+    "telegram_last_success_s_ago": None,
+    "telegram_last_error":         _notifier_module_error or "not yet started",
+    "telegram_sends":              0,
+    "telegram_drops":              0,
+    "notifier_queue_depth":        0,
+    "notifier_queue_drops":        0,
 }
 _health_lock = threading.Lock()
 
@@ -379,6 +411,16 @@ class _HealthHandler(http.server.BaseHTTPRequestHandler):
                     int(time.time() - _snapshot_last_write_ts)
                     if _snapshot_last_write_ts > 0 else None
                 )
+                # Notifier / Telegram observability.
+                _health["notifier_queue_depth"] = _notify_q.qsize()
+                if telegram_notifier is not None:
+                    _health["telegram_last_success_s_ago"] = (
+                        int(time.time() - telegram_notifier.last_success_ts)
+                        if telegram_notifier.last_success_ts > 0 else None
+                    )
+                    _health["telegram_last_error"] = telegram_notifier.last_error
+                    _health["telegram_sends"]      = telegram_notifier.send_count
+                    _health["telegram_drops"]      = telegram_notifier.drop_count
                 body = json.dumps(_health, indent=2).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -489,10 +531,200 @@ def _mqtt_worker(cfg: dict):
                 pass
 
 
+# ─────────────────────────── NOTIFIER BUS (TELEGRAM) ──────────────────────────
+# Dedicated worker thread + bounded queue, mirroring the _mqtt_worker pattern.
+# emit_alert dispatches here non-blocking; the worker owns the 150ms snapshot-
+# file wait and the blocking HTTP retry path so the main loop is never held.
+_notify_q: queue.Queue = queue.Queue(maxsize=CFG["notifier_queue"])
+_notifier_queue_drops = 0
+
+# Audio class substrings that map to CRITICAL severity. Keep in lock-step with
+# dashboard_static/index.html:878 CRITICAL_AUDIO_CLASSES.
+_CRITICAL_AUDIO_CLASSES = ("gunshot", "scream", "glass", "alarm", "siren")
+
+
+def _severity_of(kind: str, detail: dict) -> str:
+    """Map an event to its canonical severity bucket.
+
+    Ported from dashboard_static/index.html:895 severityOf(). Returns the
+    uppercase canonical names that telegram_notifier expects
+    (CRITICAL/HIGH/MEDIUM/LOW/INFO). The "high→critical" and
+    "medium→high" upgrades from detail.severity are preserved verbatim so
+    Telegram and dashboard agree on the severity badge for any event; see
+    FOLLOWUPS entry on severity-upgrade audit for whether that's right.
+
+    Args:
+        kind: event kind string (thermal/audio/detection/loitering/etc.).
+        detail: event detail dict.
+
+    Returns:
+        One of CRITICAL, HIGH, MEDIUM, LOW, INFO.
+    """
+    raw = str(detail.get("severity") or "").lower()
+    if raw in ("critical", "high"):
+        return "CRITICAL"
+    if raw == "medium":
+        return "HIGH"
+    if raw == "low":
+        return "LOW"
+
+    k = str(kind or "").lower()
+    if k in ("anomaly", "thermal"):
+        return "CRITICAL"
+    if k == "audio":
+        c = str(detail.get("class") or "").lower()
+        if any(x in c for x in _CRITICAL_AUDIO_CLASSES):
+            return "CRITICAL"
+        return "HIGH"
+    if k == "loitering":
+        return "HIGH"
+    if k == "detection":
+        return "MEDIUM"
+    if k in ("detection_summary", "face_match"):
+        return "LOW"
+    return "INFO"
+
+
+def _summary_of(kind: str, detail: dict) -> str:
+    """Build a short human-readable summary for a Telegram notification.
+
+    Parallels dashboard_server.py:173 format_event_for_ui() summary rules,
+    with explicit thermal and face_match cases that the dashboard currently
+    falls through to "Unknown event" (see FOLLOWUPS entry).
+
+    Args:
+        kind: event kind string.
+        detail: event detail dict.
+
+    Returns:
+        One-line summary suitable for a notification body.
+    """
+    k = str(kind or "").lower()
+    if k == "detection_summary":
+        return str(detail.get("label") or "Detection summary")
+    if k == "detection":
+        class_name = str(detail.get("class_name") or "object").replace("_", " ")
+        return f"1 {class_name.lower()} detected"
+    if k == "loitering":
+        zone = detail.get("zone", "unknown")
+        return f"Loitering detected in {zone}"
+    if k == "audio":
+        sound = detail.get("class", "unknown")
+        return f"Audio alert: {sound}"
+    if k == "anomaly":
+        return "Anomaly detected"
+    if k == "thermal":
+        c = detail.get("celsius") or detail.get("temperature_c")
+        try:
+            return f"Thermal alert: {float(c):.1f}°C" if c is not None else "Thermal alert"
+        except (TypeError, ValueError):
+            return "Thermal alert"
+    if k == "face_match":
+        name = detail.get("name") or detail.get("identity") or "unknown"
+        return f"Face match: {name}"
+    return f"{k.replace('_', ' ').capitalize()} event"
+
+
+def _dispatch_notify(
+    event_id: int, camera_id: str, kind: str, detail: dict,
+    snapshot_path: "str | None",
+) -> None:
+    """Severity-filter then enqueue a notify job. Non-blocking.
+
+    First-layer severity filter — avoids enqueuing events the notifier would
+    drop anyway, keeping the queue depth meaningful. The notifier module
+    re-applies the same filter at the module boundary (belt-and-suspenders —
+    future callers that bypass emit_alert still get filtered).
+    """
+    global _notifier_queue_drops
+    if telegram_notifier is None or not CFG.get("notifier_enabled", True):
+        return
+    severity = _severity_of(kind, detail)
+    if severity not in telegram_notifier.NOTIFY_LEVELS:
+        return
+    summary = _summary_of(kind, detail)
+    site = str(CFG.get("site_name") or "unknown")
+    try:
+        _notify_q.put_nowait(
+            (severity, site, camera_id, summary, event_id, snapshot_path)
+        )
+    except queue.Full:
+        _notifier_queue_drops += 1
+        _hset(notifier_queue_drops=_notifier_queue_drops)
+        log.warning(
+            "NOTIFIER queue full — dropped event=%d severity=%s",
+            event_id, severity,
+        )
+
+
+def _notify_worker(cfg: dict) -> None:
+    """Background thread — drain _notify_q into telegram_notifier.notify().
+
+    Owns the 150ms snapshot-file wait so emit_alert stays non-blocking. Each
+    enqueued job is (severity, site, camera, summary, event_id, snapshot_path).
+    """
+    log.info("NOTIFIER worker thread started")
+    while True:
+        try:
+            item = _notify_q.get(timeout=1.0)
+        except queue.Empty:
+            continue
+        try:
+            severity, site, camera, summary, event_id, snapshot_path = item
+
+            # Bounded wait for snapshot file to land on disk (Option B from
+            # Phase 4 design §5c). Typical readiness is ~3ms; we poll at 10ms
+            # for up to 150ms. On timeout, notify text-only so the alert
+            # still ships.
+            if snapshot_path:
+                deadline = time.time() + 0.150
+                ready = False
+                while time.time() < deadline:
+                    if Path(snapshot_path).is_file():
+                        ready = True
+                        break
+                    time.sleep(0.010)
+                if not ready:
+                    log.info(
+                        "NOTIFIER snapshot not ready after 150ms — "
+                        "sending text-only event=%d", event_id,
+                    )
+                    snapshot_path = None
+
+            telegram_notifier.notify(
+                severity, site, camera, summary, event_id, snapshot_path,
+            )
+        except Exception as e:
+            log.exception(
+                "NOTIFIER worker: unexpected error (continuing): %s", e,
+            )
+
+
+def start_notify_worker(cfg: dict) -> None:
+    """Spawn the notifier worker thread if the module and toggle allow it."""
+    if telegram_notifier is None:
+        log.warning(
+            "NOTIFIER worker not started: module unavailable "
+            "(see earlier NOTIFIER module log)"
+        )
+        return
+    if not cfg.get("notifier_enabled", True):
+        log.info(
+            "NOTIFIER disabled via CFG[notifier_enabled]=False — "
+            "Telegram alerts off"
+        )
+        return
+    threading.Thread(
+        target=_notify_worker, args=(cfg,), daemon=True, name="notifier",
+    ).start()
+
+
 def emit_alert(camera_id: str, kind: str, detail: dict):
     event_id = _next_event_id()
     # Phase 4: best-effort snapshot capture. Never blocks; degrades silently.
-    _snapshot_enqueue(event_id)
+    # snapshot_path is the intended destination; the file may not exist yet —
+    # the notifier worker polls for it (150ms max) before sending.
+    snapshot_path = _snapshot_enqueue(event_id)
     payload = {
         "camera":   camera_id,
         "kind":     kind,
@@ -506,6 +738,9 @@ def emit_alert(camera_id: str, kind: str, detail: dict):
         _alert_q.put_nowait(payload)
     except queue.Full:
         log.warning("Alert queue full — dropped")
+
+    # Phase 5: dispatch Telegram notify (non-blocking, severity-filtered).
+    _dispatch_notify(event_id, camera_id, kind, detail, snapshot_path)
 
 
 # ─────────────────────────── YOLO ─────────────────────────────────────────────
@@ -885,6 +1120,7 @@ def run(cfg: dict):
     start_thermal_monitor(cfg)
     _setup_snapshot_dir(cfg)
     start_snapshot_writer(cfg)
+    start_notify_worker(cfg)
 
     # ── Load models ────────────────────────────────────────────────────────────
     yolo      = load_yolo(cfg["yolo_engine"])
