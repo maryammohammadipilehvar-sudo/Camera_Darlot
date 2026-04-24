@@ -6,6 +6,8 @@ sufficient context to pick up in a future session.
 
 ### Build real remote notification channel (HIGH)
 
+**RESOLVED (Session 4, commits 5bca47a + 5f9cb1f + c091b41)**
+
 The pipeline emits MQTT to `security/alerts` but no verified subscriber
 exists. For an autonomous deployment this is THE critical gap: detection
 without notification means the system tells no one.
@@ -96,6 +98,8 @@ ask "does this scale to 10 sites with different customers?"
 - Medium urgency — these don't actively break anything today, but they're the pattern that hid Fix A for days.
 
 ### Capture event-time frame snapshot for modal evidence (MEDIUM)
+
+**RESOLVED (Session 4, commit 5f9cb1f)**
 
 Session 3 modal renders a placeholder ("No snapshot captured") because
 the backend doesn't persist frames at event-emit time. Real work:
@@ -211,3 +215,41 @@ annotated frames to Telegram as evidence.
 Fix: find the raw-dict draw call and either remove it or put it
 behind a `cfg["behavior_debug_overlay"] = False` toggle (per
 CLAUDE.md #13).  Small, self-contained, high-visual-impact change.
+
+### Audit severity-upgrade logic (MEDIUM)
+
+Both `severityOf()` in `dashboard_static/index.html:895` and
+`_severity_of()` in `detect.py` (added in Session 4 Phase 5,
+commit c091b41) collapse `detail.severity="high"` → CRITICAL and
+`detail.severity="medium"` → HIGH. Phase 5 preserved this verbatim
+for parity so Telegram and dashboard agree on the badge for any
+event.
+
+Open question: is the upgrade intentional product semantics
+(backend severities are "advisory" and the UI applies a strictness
+bump), or a historical accident? Both sources behave identically
+today, so "disagreement" isn't possible — but if the upgrade is
+wrong, both have to be fixed together.
+
+Decision points when revisiting:
+- What severities do each emit_alert caller currently pass in
+  `detail.severity`? Inventory them.
+- Do the backend defaults (`"severity": "medium" if class_name ==
+  "person" else "low"` in the detection path) reflect the intended
+  ceiling, or were they set with the upgrade in mind?
+- If the upgrade is wrong, remove it in one atomic change across
+  `_severity_of` + `severityOf` so dashboard and Telegram stay in
+  lock-step.
+
+### Port _summary_of() coverage to dashboard_server.py (LOW)
+
+Session 4 Phase 5 added `_summary_of()` in `detect.py` with
+explicit cases for thermal and face_match kinds. The dashboard's
+`format_event_for_ui()` in `dashboard_server.py:173` still falls
+through to "Unknown event" for those kinds.
+
+Straightforward parity port: copy the thermal and face_match
+branches from `detect.py:_summary_of` into
+`format_event_for_ui`. Small, low-risk change, improves admin UX
+for thermal-zone and identity-match events without touching the
+detection path.
