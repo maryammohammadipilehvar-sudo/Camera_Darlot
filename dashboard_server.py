@@ -229,6 +229,17 @@ def format_event_for_ui(event: dict) -> dict:
             or f"Behavior: {detail.get('action', 'unknown')}"
         )
 
+    elif kind == "forbidden_zone":
+        zone = detail.get("zone") or detail.get("zone_name") or "zone"
+        summary = f"Intrusion: {zone}"
+
+    elif kind == "phone_use":
+        tid = detail.get("track_id")
+        if isinstance(tid, int) and tid >= 0:
+            summary = f"Phone use — Person #{tid}"
+        else:
+            summary = "Phone use detected"
+
     event["detail"] = detail
     event["display_time"] = display_time
     event["display_short_time"] = short_time

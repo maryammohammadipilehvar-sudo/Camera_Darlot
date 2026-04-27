@@ -1441,9 +1441,12 @@ def emit_alert(camera_id: str, kind: str, detail: dict) -> None:
         "kind":     kind,
         "ts":       time.time(),
         "label":    detail.get("label", kind),
-        "severity": detail.get("severity", "low"),
         **detail,
-        "event_id": event_id,  # after **detail so callers can't clobber
+        # Computed severity wins over any operator hint in detail. Placed
+        # AFTER **detail so callers can't clobber. Lowercased to match the
+        # dashboard's severity-meta keys ('critical'/'high'/'medium'/...).
+        "severity": severity.lower(),
+        "event_id": event_id,
     }
     try:
         _alert_q.put_nowait(payload)

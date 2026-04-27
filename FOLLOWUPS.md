@@ -385,28 +385,13 @@ CLAUDE.md #13).  Small, self-contained, high-visual-impact change.
 
 ### Audit severity-upgrade logic (MEDIUM)
 
-Both `severityOf()` in `dashboard_static/index.html:895` and
-`_severity_of()` in `detect.py` (added in Session 4 Phase 5,
-commit c091b41) collapse `detail.severity="high"` → CRITICAL and
-`detail.severity="medium"` → HIGH. Phase 5 preserved this verbatim
-for parity so Telegram and dashboard agree on the badge for any
-event.
-
-Open question: is the upgrade intentional product semantics
-(backend severities are "advisory" and the UI applies a strictness
-bump), or a historical accident? Both sources behave identically
-today, so "disagreement" isn't possible — but if the upgrade is
-wrong, both have to be fixed together.
-
-Decision points when revisiting:
-- What severities do each emit_alert caller currently pass in
-  `detail.severity`? Inventory them.
-- Do the backend defaults (`"severity": "medium" if class_name ==
-  "person" else "low"` in the detection path) reflect the intended
-  ceiling, or were they set with the upgrade in mind?
-- If the upgrade is wrong, remove it in one atomic change across
-  `_severity_of` + `severityOf` so dashboard and Telegram stay in
-  lock-step.
+**RESOLVED.** `_severity_of()` in `detect.py` was deleted in
+Session 5 (replaced by table-driven `compute_severity`). The JS
+`severityOf()` upgrade (high→critical, medium→high) is also
+retired now that `emit_alert` stamps the computed severity
+directly into the events row. Both surfaces read the same
+truth from the severity table; what the operator configures is
+what they see.
 
 ### Port _summary_of() coverage to dashboard_server.py (LOW)
 

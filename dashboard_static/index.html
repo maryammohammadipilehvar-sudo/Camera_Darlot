@@ -675,6 +675,15 @@ function summary(ev){
   if(ev.kind==='audio') return det.class ? `Audio alert: ${det.class}` : 'Audio alert';
   if(ev.kind==='anomaly') return 'Anomaly detected';
   if(ev.kind==='behavior') return det.label || `Behavior: ${det.action || 'unknown'}`;
+  if(ev.kind==='forbidden_zone'){
+    const zone = det.zone || det.zone_name || 'zone';
+    return `Intrusion: ${zone}`;
+  }
+  if(ev.kind==='phone_use'){
+    const tid = det.track_id;
+    if(typeof tid === 'number' && tid >= 0) return `Phone use — Person #${tid}`;
+    return 'Phone use detected';
+  }
   return ev.kind || 'event';
 }
 function pill(id,ok){
@@ -931,25 +940,31 @@ function esc(ev){
   return JSON.stringify(JSON.stringify(ev));  // double-encode for onclick attr
 }
 
-// Map event → severity key.
-//   1. detail.severity string wins if recognisable ("critical"/"high"/"medium"/"low")
-//   2. otherwise derive from kind (+ audio class for audio events)
+// Map event → severity key. Backend (compute_severity in detect.py) is the
+// source of truth: emit_alert stamps the lowercase computed severity into
+// the events row. The previous "high → critical / medium → high" upgrade
+// has been retired now that the backend severity is honest.
+//
+// Falls back to a kind-based guess only when detail.severity is missing or
+// unrecognisable — defensive coverage for legacy rows or future event kinds.
 function severityOf(ev){
   const det = ev.detail || {};
   const raw = String(det.severity || '').toLowerCase();
-  if(raw === 'critical' || raw === 'high') return 'critical';
-  if(raw === 'medium') return 'high';
-  if(raw === 'low') return 'low';
+  if(raw === 'critical' || raw === 'high' || raw === 'medium' ||
+     raw === 'low' || raw === 'info') return raw;
 
   const kind = ev.kind || ev.display_kind || '';
-  if(kind === 'anomaly' || kind === 'thermal') return 'critical';
+  if(kind === 'forbidden_zone') return 'critical';
+  if(kind === 'anomaly' || kind === 'thermal') return 'high';
   if(kind === 'audio'){
     const c = String(det.class || '').toLowerCase();
-    return CRITICAL_AUDIO_CLASSES.some(x => c.includes(x)) ? 'critical' : 'high';
+    return CRITICAL_AUDIO_CLASSES.some(x => c.includes(x)) ? 'critical' : 'low';
   }
   if(kind === 'loitering') return 'high';
+  if(kind === 'phone_use') return 'low';
   if(kind === 'detection') return 'medium';
-  if(kind === 'detection_summary' || kind === 'face_match') return 'low';
+  if(kind === 'detection_summary' || kind === 'face_match' ||
+     kind === 'behavior') return 'low';
   return 'info';
 }
 
