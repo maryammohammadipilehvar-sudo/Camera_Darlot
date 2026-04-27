@@ -268,6 +268,9 @@ body::after{content:'';position:fixed;inset:0;
   transition:border-color .2s,background .2s;
   animation:slideIn .22s cubic-bezier(.2,.8,.4,1)}
 .ev-card:hover{border-color:var(--border2);background:var(--bg4)}
+/* CRITICAL events (forbidden_zone, fire-class audio, etc.) — red card. */
+.ev-card.sev-crit{background:var(--red-d);border-color:var(--red)}
+.ev-card.sev-crit:hover{background:rgba(255,77,77,.22);border-color:var(--red)}
 @keyframes slideIn{from{opacity:0;transform:translateX(10px)}to{opacity:1;transform:none}}
 
 .ev-bar{width:3px;flex-shrink:0}
@@ -825,8 +828,14 @@ function renderFeed(){
     const s=summary(ev);
     const t=ev.display_short_time || rel(ev.ts);
     const cam=ev.display_camera || ev.camera || '';
-    return `<div class="ev-card" onclick='openModal(${esc(ev)})'>
-      <div class="ev-bar" style="background:${m.c}"></div>
+    // Severity drives the card colour (left bar + critical-card highlight)
+    // so a forbidden-zone breach reads as RED at a glance. The kind badge
+    // still shows the category in the top-row pill.
+    const sev = severityOf(ev);
+    const sevMeta = SEVERITY_META[sev] || SEVERITY_META.info;
+    const sevCls = sev === 'critical' ? ' sev-crit' : '';
+    return `<div class="ev-card${sevCls}" onclick='openModal(${esc(ev)})'>
+      <div class="ev-bar" style="background:${sevMeta.color}"></div>
       <div class="ev-body">
         <div class="ev-top">
           <span class="badge ${m.cls}">${m.lbl}</span>
