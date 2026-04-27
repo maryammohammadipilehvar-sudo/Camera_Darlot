@@ -4,6 +4,88 @@ Deferred work captured from audits and verification runs. Items here are
 intentionally not blocking the current change; each entry notes urgency and
 sufficient context to pick up in a future session.
 
+### Track dedup over-suppresses sustained presence (HIGH)
+
+Session 5 foreground test (2026-04-27, 13:05–13:08, CLOSED mode):
+1 person walking in frame for 3 minutes produced 1 fired_telegram +
+419 suppressed_dedup_track. A real intruder lingering for 5+ minutes
+would only generate one alert under the current 5-minute track-aware
+window.
+
+Rules tuning options to evaluate before customer deployment with
+real warehouse traffic:
+
+- Severity-aware dedup windows (e.g., CRITICAL=30s, HIGH=60s,
+  LOW=300s) so high-severity tracks re-fire faster than low ones.
+- Track-loss-aware re-firing: when a track_id is dropped and
+  recovered (or a new track_id appears in the same zone), reset
+  the dedup state for that kind.
+- Movement / zone-change re-firing: significant displacement in
+  bbox or polygon transitions triggers a re-alert even within the
+  dedup window.
+
+Decide before customer deployment with real warehouse traffic.
+The 5-minute window was a deliberate noise-reduction choice for
+the bring-up; production behavior needs the tuning above.
+
+### First-event snapshot race (LOW)
+
+The very first emit_alert after process startup fires before the
+snapshot writer thread is warm. Result observed in Session 5
+foreground test: `photo=False` on the first Telegram message
+(text-only). Subsequent events ship with photos correctly.
+
+Mitigations: (a) prime the snapshot writer at startup with a
+one-shot warm frame, (b) extend the first-event 150ms wait
+specifically (e.g., 1s grace for event_id=1), (c) ignore — the
+pipeline runs continuously in production and only loses a photo
+on cold restart, which is operator-visible already via systemd
+logs.
+
+Cosmetic in production. Worth fixing alongside any other
+snapshot-pipeline tuning.
+
+### ffmpeg H264 'Overread VUI by 8 bits' decoder noise (LOW)
+
+Pre-existing, harmless H264 decoder warnings from the camera RTSP
+stream — typically 2 lines per cold start, more if the encoder
+restarts. Doesn't affect decoding correctness. Adds clutter to
+log greps for `error` / `warning` and trips reflexive concern
+during incident review.
+
+Fix: pipe ffmpeg stderr through a filter that drops known-benign
+warnings, OR set `OPENCV_FFMPEG_LOGLEVEL=quiet` (verify it doesn't
+mask real errors first).
+
+### alert_audit retention policy (LOW)
+
+Currently grows unbounded at ~876k rows/year (estimate from
+Session 5 audit math). Manageable on the Jetson SSD for years,
+but not forever. Add daily prune or rolling-window archive
+before the audit table exceeds 10M rows or 1GB.
+
+Approach options: (a) DELETE rows older than 90 days on a
+cron-style timer, (b) weekly export to a compressed archive
+file before delete, (c) partition by month into separate
+tables. (a) is simplest; (b) preserves forensic value; (c) is
+overkill at this scale.
+
+### Dashboard surfaces alert_audit (MEDIUM)
+
+Operators currently can't see why an alert was suppressed —
+the dashboard reads `events`, but suppressed-INFO and dedup-
+suppressed decisions never write events rows; they exist only
+in `alert_audit`. Without dashboard visibility, operators
+cannot tune dedup windows from observed behavior.
+
+Build a "Suppressed Alerts" view in the dashboard that queries
+alert_audit with a small set of canned filters (last hour, by
+camera, by reason). Read-only; no actions. Pair with the dedup-
+tuning work in the HIGH FOLLOWUPS entry above so operators can
+see the impact of any window change.
+
+Later session — depends on production traffic to be useful.
+
 ### Build real remote notification channel (HIGH)
 
 **RESOLVED (Session 4, commits 5bca47a + 5f9cb1f + c091b41)**

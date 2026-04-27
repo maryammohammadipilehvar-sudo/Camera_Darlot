@@ -17,6 +17,10 @@ Changes from v1:
 """
 
 import os, time, signal, logging, threading, json, queue, collections, http.server, itertools
+import sqlite3
+import sys
+from datetime import datetime
+from typing import Optional
 
 import re
 from pathlib import Path
@@ -87,9 +91,8 @@ CFG = {
     "behavior_every_n": 3,         # run behavior every Nth detection frame
     "anomaly_every_n":  999999,    # set to e.g. 30 when patchcore is built
 
-    # Alert deduplication
-    "alert_cooldown_sec": 30.0,    # per object, per kind
-    "object_ttl_sec":     20.0,
+    # Scene-summary cadence (per-object cooldown removed in Session 5;
+    # dedup now lives in the central decision pipeline — see "dedup" key).
     "summary_min_gap":     5.0,    # min seconds between scene-summary events
 
     # Zone rules
@@ -122,6 +125,60 @@ CFG = {
     # Telegram notifier
     "notifier_enabled": True,     # set False to disable push alerts at startup
     "notifier_queue":   100,      # detect.py-side queue for notify jobs
+
+    # ── Operating-mode schedule (Session 5) ───────────────────────
+    # ISO weekday: 1=Mon ... 7=Sun. Hours are local time (system tz).
+    # Weekdays absent from occupied_hours → CLOSED all day.
+    # holidays: list of "YYYY-MM-DD" strings; CLOSED override.
+    # maintenance: True forces MAINTENANCE mode globally. Operator-set
+    #   today (CFG edit + restart). TODO admin-UI toggle in a later session.
+    "schedule": {
+        "occupied_hours": {
+            1: ("06:00", "20:00"),
+            2: ("06:00", "20:00"),
+            3: ("06:00", "20:00"),
+            4: ("06:00", "20:00"),
+            5: ("06:00", "20:00"),
+        },
+        "holidays": [],
+        "maintenance": False,
+    },
+
+    # ── Severity table (Session 5) ────────────────────────────────
+    # Maps "<kind>" or "<kind>:<subtype>" → {mode: severity}.
+    # PUBLIC zone only this session — every event treated as zone="main".
+    "severity_table": {
+        "detection":          {"OCCUPIED": "INFO",     "CLOSED": "HIGH",     "MAINTENANCE": "INFO"},
+        "detection_summary":  {"OCCUPIED": "INFO",     "CLOSED": "LOW",      "MAINTENANCE": "INFO"},
+        "loitering":          {"OCCUPIED": "LOW",      "CLOSED": "HIGH",     "MAINTENANCE": "LOW"},
+        "face_match:known":   {"OCCUPIED": "INFO",     "CLOSED": "LOW",      "MAINTENANCE": "INFO"},
+        "face_match:unknown": {"OCCUPIED": "LOW",      "CLOSED": "HIGH",     "MAINTENANCE": "LOW"},
+        "face_match:banned":  {"OCCUPIED": "CRITICAL", "CLOSED": "CRITICAL", "MAINTENANCE": "CRITICAL"},
+        "audio:critical":     {"OCCUPIED": "CRITICAL", "CLOSED": "CRITICAL", "MAINTENANCE": "CRITICAL"},
+        "audio":              {"OCCUPIED": "LOW",      "CLOSED": "MEDIUM",   "MAINTENANCE": "LOW"},
+        "thermal":            {"OCCUPIED": "HIGH",     "CLOSED": "HIGH",     "MAINTENANCE": "HIGH"},
+        "thermal:fire":       {"OCCUPIED": "CRITICAL", "CLOSED": "CRITICAL", "MAINTENANCE": "CRITICAL"},
+        "anomaly":            {"OCCUPIED": "HIGH",     "CLOSED": "CRITICAL", "MAINTENANCE": "HIGH"},
+    },
+
+    # ── Notification thresholds (Session 5) ───────────────────────
+    # MAINTENANCE column suppresses everything except CRITICAL (HIGH still
+    # writes to dashboard so operators can review post-window).
+    "thresholds": {
+        "CRITICAL": {"OCCUPIED": "telegram",   "CLOSED": "telegram",   "MAINTENANCE": "telegram"},
+        "HIGH":     {"OCCUPIED": "telegram",   "CLOSED": "telegram",   "MAINTENANCE": "dashboard"},
+        "MEDIUM":   {"OCCUPIED": "dashboard",  "CLOSED": "telegram",   "MAINTENANCE": "suppressed"},
+        "LOW":      {"OCCUPIED": "dashboard",  "CLOSED": "dashboard",  "MAINTENANCE": "suppressed"},
+        "INFO":     {"OCCUPIED": "suppressed", "CLOSED": "dashboard",  "MAINTENANCE": "suppressed"},
+    },
+
+    # ── Three-layer dedup windows (Session 5, Telegram-bound only) ──
+    "dedup": {
+        "track_window_s":  300,    # 5 min — same (camera, track_id, kind)
+        "zone_window_s":   120,    # 2 min — same (camera, zone, kind)
+        "burst_window_s":   30,    # rolling burst window
+        "burst_threshold":   3,    # N within burst_window_s → fire summary
+    },
 }
 
 ALLOWED_CLASSES = {0, 2, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23}
@@ -176,6 +233,11 @@ _health = {
     "telegram_drops":              0,
     "notifier_queue_depth":        0,
     "notifier_queue_drops":        0,
+    # Session 5 — mode + audit observability (computed live in /health handler)
+    "current_mode":                  "UNKNOWN",
+    "alerts_fired_last_hour":        0,
+    "alerts_suppressed_last_hour":   {},
+    "audit_log_size":                0,
 }
 _health_lock = threading.Lock()
 
@@ -421,6 +483,16 @@ class _HealthHandler(http.server.BaseHTTPRequestHandler):
                     _health["telegram_last_error"] = telegram_notifier.last_error
                     _health["telegram_sends"]      = telegram_notifier.send_count
                     _health["telegram_drops"]      = telegram_notifier.drop_count
+                # Session 5 — mode + audit observability.
+                try:
+                    _health["current_mode"] = resolve_mode(CFG)
+                except Exception as e:
+                    _health["current_mode"] = "ERROR"
+                    log.warning("HEALTH resolve_mode failed: %s", e)
+                fired, suppressed, total = _audit_count_since(3600)
+                _health["alerts_fired_last_hour"]      = fired
+                _health["alerts_suppressed_last_hour"] = suppressed
+                _health["audit_log_size"]              = total
                 body = json.dumps(_health, indent=2).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -470,6 +542,470 @@ def start_thermal_monitor(cfg: dict):
 
     threading.Thread(target=_run, daemon=True, name="thermal").start()
     log.info("Thermal monitor started")
+
+
+# ─────────────────────────── MODE RESOLUTION (Session 5) ──────────────────────
+# OCCUPIED / CLOSED / MAINTENANCE — resolved at decision time from CFG schedule
+# and the system clock. Pure: never reads global state, never caches.
+
+_VALID_MODES = ("OCCUPIED", "CLOSED", "MAINTENANCE")
+
+
+def _parse_hhmm(s: str) -> "tuple[int, int]":
+    """Parse 'HH:MM' → (hour, minute). Raises ValueError on malformed input."""
+    parts = s.split(":")
+    if len(parts) != 2:
+        raise ValueError(f"expected HH:MM, got {s!r}")
+    h, m = int(parts[0]), int(parts[1])
+    if not (0 <= h <= 24 and 0 <= m <= 59):
+        raise ValueError(f"out-of-range time {s!r}")
+    return h, m
+
+
+def _validate_schedule(cfg: dict) -> None:
+    """Fail loud at startup on schedule misconfiguration.
+
+    Better to crash than to silently run in the wrong mode. Called once
+    from run() before any worker thread spawns.
+    """
+    sched = cfg.get("schedule")
+    if not isinstance(sched, dict):
+        raise ValueError("CFG['schedule'] missing or not a dict")
+    occ = sched.get("occupied_hours", {})
+    if not isinstance(occ, dict):
+        raise ValueError("CFG['schedule']['occupied_hours'] must be a dict")
+    for wd, window in occ.items():
+        if not (isinstance(wd, int) and 1 <= wd <= 7):
+            raise ValueError(
+                f"occupied_hours weekday must be int 1..7, got {wd!r}"
+            )
+        if not (isinstance(window, (list, tuple)) and len(window) == 2):
+            raise ValueError(
+                f"occupied_hours[{wd}] must be (start, end) pair, got {window!r}"
+            )
+        start_h, start_m = _parse_hhmm(str(window[0]))
+        end_h, end_m = _parse_hhmm(str(window[1]))
+        # Allow end <= start (zero-length or wraparound) — operator may use
+        # ("00:00", "00:00") to flip a weekday into CLOSED for foreground tests.
+        _ = (start_h, start_m, end_h, end_m)
+    holidays = sched.get("holidays", [])
+    if not isinstance(holidays, list):
+        raise ValueError("CFG['schedule']['holidays'] must be a list")
+    for d in holidays:
+        try:
+            datetime.strptime(str(d), "%Y-%m-%d")
+        except ValueError as e:
+            raise ValueError(f"holiday {d!r} not in YYYY-MM-DD format: {e}")
+    if not isinstance(sched.get("maintenance", False), bool):
+        raise ValueError("CFG['schedule']['maintenance'] must be bool")
+
+
+def resolve_mode(cfg: dict, now: Optional[datetime] = None) -> str:
+    """Return current operating mode: OCCUPIED, CLOSED, or MAINTENANCE.
+
+    Precedence: maintenance flag > holiday > weekday window > CLOSED.
+
+    Args:
+        cfg: pipeline config dict (must contain a validated 'schedule').
+        now: datetime to evaluate against; defaults to local now().
+
+    Returns:
+        One of OCCUPIED, CLOSED, MAINTENANCE.
+    """
+    sched = cfg["schedule"]
+    if sched.get("maintenance", False):
+        return "MAINTENANCE"
+    if now is None:
+        now = datetime.now()
+    today_str = now.strftime("%Y-%m-%d")
+    if today_str in sched.get("holidays", []):
+        return "CLOSED"
+    weekday = now.isoweekday()  # 1..7
+    window = sched.get("occupied_hours", {}).get(weekday)
+    if not window:
+        return "CLOSED"
+    start_h, start_m = _parse_hhmm(str(window[0]))
+    end_h, end_m = _parse_hhmm(str(window[1]))
+    minute_of_day = now.hour * 60 + now.minute
+    start = start_h * 60 + start_m
+    end = end_h * 60 + end_m
+    if start == end:
+        return "CLOSED"  # zero-length window → effectively CLOSED
+    if start < end:
+        return "OCCUPIED" if start <= minute_of_day < end else "CLOSED"
+    # Wraparound (e.g., night shift): OCCUPIED if either side of midnight.
+    return "OCCUPIED" if (minute_of_day >= start or minute_of_day < end) else "CLOSED"
+
+
+# ─────────────────────────── SEVERITY + DECISION (Session 5) ──────────────────
+# Pure functions. Driven by CFG tables; no hidden constants.
+
+_SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")
+_DECISIONS = ("telegram", "dashboard", "suppressed")
+
+# Logged-once-per-process so an unmapped kind doesn't spam.
+_severity_unknown_seen: set = set()
+_threshold_unknown_seen: set = set()
+
+
+def _subtype_of(kind: str, detail: dict) -> str:
+    """Derive severity-table subtype from event kind + detail.
+
+    Returns "" when the kind has no sub-classification. Keeps callers
+    free of the table's lookup convention — they keep emitting their
+    natural detail keys (e.g., audio class names).
+    """
+    k = (kind or "").lower()
+    if k == "audio":
+        c = str(detail.get("class") or "").lower()
+        if any(x in c for x in _CRITICAL_AUDIO_CLASSES):
+            return "critical"
+        return ""
+    if k == "face_match":
+        mk = str(detail.get("match_kind") or "").lower()
+        if mk in ("banned", "known", "unknown"):
+            return mk
+        return ""
+    if k == "thermal":
+        # No fire classifier yet; keep entry forward-compatible.
+        if str(detail.get("fire") or "").lower() in ("1", "true", "yes"):
+            return "fire"
+        return ""
+    return ""
+
+
+def compute_severity(
+    kind: str,
+    detail: dict,
+    mode: str,
+    cfg: dict,
+    zone: str = "main",
+) -> str:
+    """Map (kind, detail, mode, zone) → severity bucket.
+
+    Pure. Reads the severity table from cfg so tests can inject a
+    fixture table. Falls back to LOW for unknown (kind, mode) pairs
+    and logs once per unknown kind.
+
+    Args:
+        kind: event kind string ("detection", "audio", ...).
+        detail: event detail dict; subtype derived via _subtype_of.
+        mode: one of OCCUPIED / CLOSED / MAINTENANCE.
+        cfg: pipeline config dict (reads cfg["severity_table"]).
+        zone: zone name; "main" until zone polygons land in a later session.
+
+    Returns:
+        One of CRITICAL, HIGH, MEDIUM, LOW, INFO.
+    """
+    table = cfg.get("severity_table", {})
+    subtype = _subtype_of(kind, detail)
+    keys = []
+    if subtype:
+        keys.append(f"{kind}:{subtype}")
+    keys.append(kind)
+    for key in keys:
+        row = table.get(key)
+        if row and mode in row:
+            sev = row[mode]
+            if sev in _SEVERITIES:
+                return sev
+    if kind not in _severity_unknown_seen:
+        _severity_unknown_seen.add(kind)
+        log.warning(
+            "SEVERITY UNKNOWN kind=%s subtype=%s mode=%s — defaulting LOW",
+            kind, subtype, mode,
+        )
+    return "LOW"
+
+
+def compute_decision(severity: str, mode: str, cfg: dict) -> str:
+    """Map (severity, mode) → 'telegram' | 'dashboard' | 'suppressed'.
+
+    Pure. Reads the threshold table from cfg.
+    """
+    table = cfg.get("thresholds", {})
+    row = table.get(severity)
+    if row and mode in row:
+        d = row[mode]
+        if d in _DECISIONS:
+            return d
+    key = (severity, mode)
+    if key not in _threshold_unknown_seen:
+        _threshold_unknown_seen.add(key)
+        log.warning(
+            "THRESHOLD UNKNOWN severity=%s mode=%s — defaulting suppressed",
+            severity, mode,
+        )
+    return "suppressed"
+
+
+# ─────────────────────────── DEDUP (Session 5) ────────────────────────────────
+# In-memory three-layer filter. Resets on restart (acceptable; windows ≤5min).
+# Coarse single lock — see design §3.
+
+# Track-aware: (camera, track_id, kind) → last fire ts
+_dedup_track: "dict[tuple[str, int, str], float]" = {}
+# Zone cooldown: (camera, zone, kind) → last fire ts
+_dedup_zone: "dict[tuple[str, str, str], float]" = {}
+# Burst window: (camera, zone, kind) → deque of timestamps within burst window
+_dedup_burst: "dict[tuple[str, str, str], collections.deque]" = (
+    collections.defaultdict(lambda: collections.deque(maxlen=64))
+)
+_dedup_lock = threading.Lock()
+_last_dedup_prune: float = 0.0
+
+
+def _dedup_prune(now: float, track_w: float, zone_w: float) -> None:
+    """Drop stale entries from track/zone dicts. Caller holds _dedup_lock."""
+    stale_t = [k for k, v in _dedup_track.items() if now - v > track_w]
+    for k in stale_t:
+        _dedup_track.pop(k, None)
+    stale_z = [k for k, v in _dedup_zone.items() if now - v > zone_w]
+    for k in stale_z:
+        _dedup_zone.pop(k, None)
+
+
+def _dedup_filter(
+    camera: str, kind: str, detail: dict, zone: str, cfg: dict,
+) -> "tuple[Optional[str], int]":
+    """Run the three-layer Telegram-bound dedup filter chain.
+
+    Returns:
+        Tuple of (suppress_reason, burst_count_at_call_time).
+        suppress_reason is one of:
+            "suppressed_dedup_track"
+            "suppressed_dedup_zone"
+            "suppressed_dedup_burst"
+            None (no suppression — caller proceeds to telegram fire)
+        burst_count is the number of recent same-kind events in the
+        current burst window AT the moment of this call. The orchestrator
+        uses it to decide whether to fire a burst-summary alongside the
+        suppress.
+    """
+    global _last_dedup_prune
+    d = cfg.get("dedup", {})
+    track_w = float(d.get("track_window_s", 300))
+    zone_w = float(d.get("zone_window_s", 120))
+    burst_w = float(d.get("burst_window_s", 30))
+    burst_th = int(d.get("burst_threshold", 3))
+
+    track_id = detail.get("track_id")
+    has_track = isinstance(track_id, int) and track_id >= 0
+
+    now = time.time()
+    with _dedup_lock:
+        # Periodic prune — synchronous, fast.
+        if now - _last_dedup_prune > 60:
+            _dedup_prune(now, track_w, zone_w)
+            _last_dedup_prune = now
+
+        # 1. Track-aware
+        if has_track:
+            tk = (camera, int(track_id), kind)
+            last = _dedup_track.get(tk)
+            if last is not None and now - last < track_w:
+                return ("suppressed_dedup_track", 0)
+            _dedup_track[tk] = now
+
+        # 2. Zone cooldown
+        zk = (camera, zone, kind)
+        last = _dedup_zone.get(zk)
+        if last is not None and now - last < zone_w:
+            return ("suppressed_dedup_zone", 0)
+        _dedup_zone[zk] = now
+
+        # 3. Burst window
+        bk = (camera, zone, kind)
+        dq = _dedup_burst[bk]
+        # Trim entries outside the rolling window
+        while dq and now - dq[0] > burst_w:
+            dq.popleft()
+        dq.append(now)
+        burst_count = len(dq)
+        if burst_count >= burst_th:
+            # Clear so next burst-summary requires a fresh threshold count.
+            # First post-clear event passes burst (count=1) but is still
+            # subject to track and zone dedup downstream.
+            dq.clear()
+            return ("suppressed_dedup_burst", burst_count)
+
+        return (None, burst_count)
+
+
+# ─────────────────────────── AUDIT LOG (Session 5) ────────────────────────────
+# Synchronous SQLite insert. Single shared connection guarded by a small lock.
+# Failures never crash the pipeline; greppable "AUDIT WRITE FAILED" prefix.
+
+_AUDIT_DECISIONS = (
+    "fired_telegram",
+    "fired_dashboard_only",
+    "fired_burst_summary",
+    "suppressed_threshold",
+    "suppressed_dedup_track",
+    "suppressed_dedup_zone",
+    "suppressed_dedup_burst",
+    "suppressed_ratelimit",
+)
+
+_audit_conn: "Optional[sqlite3.Connection]" = None
+_audit_lock = threading.Lock()
+# Separate read-only connection for /health queries. WAL allows concurrent
+# readers without blocking the writer; using a distinct connection avoids
+# Python's per-Connection internal mutex serializing /health reads against
+# emit_alert writes.
+_audit_read_conn: "Optional[sqlite3.Connection]" = None
+_audit_read_lock = threading.Lock()
+
+
+def _audit_db_path() -> str:
+    """Resolve the audit DB path — same DB the dashboard uses."""
+    return os.getenv(
+        "DB_PATH",
+        str(Path(__file__).parent / "sentinel_events.db"),
+    )
+
+
+def _audit_init() -> None:
+    """Open the audit DB connection and ensure schema. Idempotent.
+
+    Must be called before any worker thread or emit_alert. Sets WAL so
+    concurrent writes from dashboard_server.py (its own connection) and
+    this module are safe.
+    """
+    global _audit_conn, _audit_read_conn
+    if _audit_conn is not None:
+        return
+    path = _audit_db_path()
+    conn = sqlite3.connect(path, check_same_thread=False, timeout=5.0)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS alert_audit (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts              INTEGER NOT NULL,
+            event_id        INTEGER,
+            camera_id       TEXT    NOT NULL,
+            kind            TEXT    NOT NULL,
+            computed_severity TEXT  NOT NULL,
+            mode            TEXT    NOT NULL,
+            decision        TEXT    NOT NULL CHECK (decision IN (
+                'fired_telegram', 'fired_dashboard_only', 'fired_burst_summary',
+                'suppressed_threshold', 'suppressed_dedup_track',
+                'suppressed_dedup_zone', 'suppressed_dedup_burst',
+                'suppressed_ratelimit'
+            )),
+            reason_detail   TEXT,
+            zone            TEXT    NOT NULL DEFAULT 'main'
+        );
+        CREATE INDEX IF NOT EXISTS idx_audit_ts        ON alert_audit(ts);
+        CREATE INDEX IF NOT EXISTS idx_audit_event_id  ON alert_audit(event_id);
+        """
+    )
+    conn.commit()
+    _audit_conn = conn
+
+    # Read-only connection for /health (mode=ro via URI keeps it honest;
+    # any accidental write attempt will raise rather than silently mutate).
+    read_conn = sqlite3.connect(
+        f"file:{path}?mode=ro", uri=True,
+        check_same_thread=False, timeout=5.0,
+    )
+    _audit_read_conn = read_conn
+
+    log.info("AUDIT DB ready: %s", path)
+
+
+def _audit_write(
+    event_id: "Optional[int]",
+    camera_id: str,
+    kind: str,
+    computed_severity: str,
+    mode: str,
+    decision: str,
+    reason_detail: "Optional[str]" = None,
+    zone: str = "main",
+) -> None:
+    """Insert one decision row. Never raises.
+
+    Args:
+        event_id: events.id when the decision wrote one; None for suppressed.
+        camera_id: camera identifier.
+        kind: event kind.
+        computed_severity: CRITICAL/HIGH/MEDIUM/LOW/INFO.
+        mode: OCCUPIED/CLOSED/MAINTENANCE.
+        decision: one of _AUDIT_DECISIONS.
+        reason_detail: optional free-form context (e.g., "count=5 window=30s").
+        zone: zone name; "main" until zone polygons land.
+    """
+    if _audit_conn is None:
+        # _audit_init wasn't called; surface loudly but don't raise.
+        log.error(
+            "AUDIT WRITE FAILED — connection not initialized "
+            "(decision=%s kind=%s)", decision, kind,
+        )
+        return
+    try:
+        with _audit_lock:
+            _audit_conn.execute(
+                "INSERT INTO alert_audit "
+                "(ts, event_id, camera_id, kind, computed_severity, "
+                " mode, decision, reason_detail, zone) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (int(time.time()), event_id, camera_id, kind,
+                 computed_severity, mode, decision, reason_detail, zone),
+            )
+            _audit_conn.commit()
+    except Exception as e:
+        log.error(
+            "AUDIT WRITE FAILED decision=%s kind=%s err=%s",
+            decision, kind, e,
+        )
+
+
+def _audit_count_since(seconds_ago: int) -> "tuple[int, dict, int]":
+    """Compute /health stats from the audit log. Live, no caching.
+
+    Reads via the dedicated read-only connection so /health never
+    serializes against emit_alert writes (WAL allows concurrent readers).
+    The smaller _audit_read_lock guards only the read connection's cursor.
+
+    Returns:
+        (alerts_fired_last_hour, alerts_suppressed_last_hour, audit_log_size).
+    """
+    if _audit_read_conn is None:
+        return (0, {}, 0)
+    cutoff = int(time.time()) - seconds_ago
+    fired = 0
+    suppressed: dict = {
+        "suppressed_threshold":   0,
+        "suppressed_dedup_track": 0,
+        "suppressed_dedup_zone":  0,
+        "suppressed_dedup_burst": 0,
+        "suppressed_ratelimit":   0,
+    }
+    total = 0
+    try:
+        with _audit_read_lock:
+            # NOTE: COUNT(*) on alert_audit is fine today. If /health latency
+            # degrades or this table exceeds ~10M rows, switch to a cached
+            # counter updated by _audit_write.
+            total = _audit_read_conn.execute(
+                "SELECT COUNT(*) FROM alert_audit"
+            ).fetchone()[0]
+            for row in _audit_read_conn.execute(
+                "SELECT decision, COUNT(*) FROM alert_audit "
+                "WHERE ts > ? GROUP BY decision",
+                (cutoff,),
+            ):
+                dec, n = row[0], row[1]
+                if dec.startswith("fired_"):
+                    fired += n
+                elif dec in suppressed:
+                    suppressed[dec] = n
+    except Exception as e:
+        log.error("AUDIT READ FAILED err=%s", e)
+    return (fired, suppressed, total)
 
 
 # ─────────────────────────── ALERT BUS (MQTT) ─────────────────────────────────
@@ -543,48 +1079,6 @@ _notifier_queue_drops = 0
 _CRITICAL_AUDIO_CLASSES = ("gunshot", "scream", "glass", "alarm", "siren")
 
 
-def _severity_of(kind: str, detail: dict) -> str:
-    """Map an event to its canonical severity bucket.
-
-    Ported from dashboard_static/index.html:895 severityOf(). Returns the
-    uppercase canonical names that telegram_notifier expects
-    (CRITICAL/HIGH/MEDIUM/LOW/INFO). The "high→critical" and
-    "medium→high" upgrades from detail.severity are preserved verbatim so
-    Telegram and dashboard agree on the severity badge for any event; see
-    FOLLOWUPS entry on severity-upgrade audit for whether that's right.
-
-    Args:
-        kind: event kind string (thermal/audio/detection/loitering/etc.).
-        detail: event detail dict.
-
-    Returns:
-        One of CRITICAL, HIGH, MEDIUM, LOW, INFO.
-    """
-    raw = str(detail.get("severity") or "").lower()
-    if raw in ("critical", "high"):
-        return "CRITICAL"
-    if raw == "medium":
-        return "HIGH"
-    if raw == "low":
-        return "LOW"
-
-    k = str(kind or "").lower()
-    if k in ("anomaly", "thermal"):
-        return "CRITICAL"
-    if k == "audio":
-        c = str(detail.get("class") or "").lower()
-        if any(x in c for x in _CRITICAL_AUDIO_CLASSES):
-            return "CRITICAL"
-        return "HIGH"
-    if k == "loitering":
-        return "HIGH"
-    if k == "detection":
-        return "MEDIUM"
-    if k in ("detection_summary", "face_match"):
-        return "LOW"
-    return "INFO"
-
-
 def _summary_of(kind: str, detail: dict) -> str:
     """Build a short human-readable summary for a Telegram notification.
 
@@ -627,26 +1121,32 @@ def _summary_of(kind: str, detail: dict) -> str:
 
 def _dispatch_notify(
     event_id: int, camera_id: str, kind: str, detail: dict,
-    snapshot_path: "str | None",
+    severity: str, snapshot_path: "str | None",
 ) -> None:
-    """Severity-filter then enqueue a notify job. Non-blocking.
+    """Enqueue a notify job. Non-blocking.
 
-    First-layer severity filter — avoids enqueuing events the notifier would
-    drop anyway, keeping the queue depth meaningful. The notifier module
-    re-applies the same filter at the module boundary (belt-and-suspenders —
-    future callers that bypass emit_alert still get filtered).
+    Called by emit_alert ONLY when the decision pipeline has already
+    determined the event should ship to Telegram — severity gating now
+    lives in compute_severity + compute_decision upstream. This function
+    does no further filtering; it just formats and enqueues.
+
+    Args:
+        event_id: monotonic event id (real id, not None).
+        camera_id: camera identifier.
+        kind: event kind.
+        detail: event detail dict.
+        severity: pre-computed severity (CRITICAL/HIGH/MEDIUM/LOW/INFO).
+        snapshot_path: optional snapshot path for the notifier worker.
     """
     global _notifier_queue_drops
     if telegram_notifier is None or not CFG.get("notifier_enabled", True):
-        return
-    severity = _severity_of(kind, detail)
-    if severity not in telegram_notifier.NOTIFY_LEVELS:
         return
     summary = _summary_of(kind, detail)
     site = str(CFG.get("site_name") or "unknown")
     try:
         _notify_q.put_nowait(
-            (severity, site, camera_id, summary, event_id, snapshot_path)
+            (severity, site, camera_id, summary, event_id, snapshot_path,
+             kind, detail.get("track_id"))
         )
     except queue.Full:
         _notifier_queue_drops += 1
@@ -661,16 +1161,24 @@ def _notify_worker(cfg: dict) -> None:
     """Background thread — drain _notify_q into telegram_notifier.notify().
 
     Owns the 150ms snapshot-file wait so emit_alert stays non-blocking. Each
-    enqueued job is (severity, site, camera, summary, event_id, snapshot_path).
+    enqueued job is
+        (severity, site, camera, summary, event_id, snapshot_path,
+         kind, track_id).
+    The trailing kind / track_id are used only to bridge the notifier's
+    rate-limit drops into the audit log.
     """
     log.info("NOTIFIER worker thread started")
+    last_seen_drop_count = (
+        telegram_notifier.drop_count if telegram_notifier else 0
+    )
     while True:
         try:
             item = _notify_q.get(timeout=1.0)
         except queue.Empty:
             continue
         try:
-            severity, site, camera, summary, event_id, snapshot_path = item
+            (severity, site, camera, summary, event_id, snapshot_path,
+             kind, _track_id) = item
 
             # Bounded wait for snapshot file to land on disk (Option B from
             # Phase 4 design §5c). Typical readiness is ~3ms; we poll at 10ms
@@ -691,9 +1199,30 @@ def _notify_worker(cfg: dict) -> None:
                     )
                     snapshot_path = None
 
-            telegram_notifier.notify(
+            ok = telegram_notifier.notify(
                 severity, site, camera, summary, event_id, snapshot_path,
             )
+
+            # Bridge: if the notifier dropped this send because of its
+            # internal rate limit, record a suppressed_ratelimit audit row
+            # so /health counts the drop.
+            if not ok and telegram_notifier is not None:
+                new_drop_count = telegram_notifier.drop_count
+                if (
+                    new_drop_count > last_seen_drop_count
+                    and telegram_notifier.last_error == "rate limit"
+                ):
+                    mode = resolve_mode(cfg)
+                    _audit_write(
+                        event_id=event_id,
+                        camera_id=camera,
+                        kind=kind,
+                        computed_severity=severity,
+                        mode=mode,
+                        decision="suppressed_ratelimit",
+                        reason_detail=f"telegram rate limit (drop #{new_drop_count})",
+                    )
+                last_seen_drop_count = new_drop_count
         except Exception as e:
             log.exception(
                 "NOTIFIER worker: unexpected error (continuing): %s", e,
@@ -719,11 +1248,125 @@ def start_notify_worker(cfg: dict) -> None:
     ).start()
 
 
-def emit_alert(camera_id: str, kind: str, detail: dict):
+def _emit_burst_summary(
+    camera_id: str, kind: str, zone: str, count: int,
+    severity: str, mode: str,
+) -> None:
+    """Fire ONE summary alert when the burst threshold trips.
+
+    Bypasses the dedup chain (it's already the burst owner). Writes the
+    fired_burst_summary audit row, ships to MQTT and Telegram (both —
+    burst summaries always go to Telegram regardless of mode threshold,
+    since the underlying events were originally telegram-bound).
+    """
+    burst_w = int(CFG.get("dedup", {}).get("burst_window_s", 30))
+    summary_event_id = _next_event_id()
+    snapshot_path = _snapshot_enqueue(summary_event_id)
+
+    # Pluralize for the "person" common case; otherwise generic.
+    label = f"{count} {kind} events in {zone} in {burst_w}s"
+    payload = {
+        "camera":   camera_id,
+        "kind":     "burst_summary",
+        "ts":       time.time(),
+        "label":    label,
+        "severity": severity.lower(),
+        "underlying_kind": kind,
+        "burst_count": count,
+        "burst_window_s": burst_w,
+        "zone": zone,
+        "event_id": summary_event_id,
+    }
+    try:
+        _alert_q.put_nowait(payload)
+    except queue.Full:
+        log.warning("Alert queue full — dropped burst_summary")
+
+    _dispatch_notify(
+        summary_event_id, camera_id, kind, {"track_id": None},
+        severity, snapshot_path,
+    )
+
+    _audit_write(
+        event_id=summary_event_id,
+        camera_id=camera_id,
+        kind=kind,
+        computed_severity=severity,
+        mode=mode,
+        decision="fired_burst_summary",
+        reason_detail=f"count={count} window_s={burst_w}",
+        zone=zone,
+    )
+
+
+def emit_alert(camera_id: str, kind: str, detail: dict) -> None:
+    """Decide → audit → ship one alert.
+
+    Orchestration only. The decision pipeline is:
+        resolve_mode → compute_severity → compute_decision
+            → (telegram path: three-layer dedup filter)
+            → write events + audit + dispatch_notify
+
+    Every call writes exactly one audit row (plus an additional
+    fired_burst_summary row when a burst trips). Suppressed decisions
+    write no events row, no Telegram, but always an audit row.
+    """
     event_id = _next_event_id()
-    # Phase 4: best-effort snapshot capture. Never blocks; degrades silently.
-    # snapshot_path is the intended destination; the file may not exist yet —
-    # the notifier worker polls for it (150ms max) before sending.
+    zone = "main"  # PUBLIC zone only this session
+
+    try:
+        mode = resolve_mode(CFG)
+    except Exception:
+        log.exception("resolve_mode failed — defaulting to CLOSED (loudest)")
+        mode = "CLOSED"
+
+    severity = compute_severity(kind, detail, mode, CFG, zone=zone)
+    decision_route = compute_decision(severity, mode, CFG)
+
+    # Audit-log integrity: if the threshold table chose "telegram" but the
+    # notifier is unavailable (module import failed) or disabled at startup,
+    # downgrade to "dashboard" so the audit row reflects what actually
+    # happens. Keeping fired_telegram in the audit when no Telegram fires
+    # would lie to operators querying the log.
+    if decision_route == "telegram" and (
+        telegram_notifier is None
+        or not CFG.get("notifier_enabled", True)
+    ):
+        decision_route = "dashboard"
+
+    # Suppressed by threshold table — no events row, no Telegram, audit only.
+    if decision_route == "suppressed":
+        _audit_write(
+            event_id=None, camera_id=camera_id, kind=kind,
+            computed_severity=severity, mode=mode,
+            decision="suppressed_threshold", zone=zone,
+        )
+        return
+
+    # Telegram path runs the three-layer dedup filter first.
+    if decision_route == "telegram":
+        suppress_reason, burst_count = _dedup_filter(
+            camera_id, kind, detail, zone, CFG,
+        )
+        if suppress_reason is not None:
+            # Suppressed individuals → audit only, no events row.
+            _audit_write(
+                event_id=None, camera_id=camera_id, kind=kind,
+                computed_severity=severity, mode=mode,
+                decision=suppress_reason, zone=zone,
+                reason_detail=(
+                    f"burst_count={burst_count}"
+                    if suppress_reason == "suppressed_dedup_burst" else None
+                ),
+            )
+            # Burst threshold tripped → fire ONE summary in addition.
+            if suppress_reason == "suppressed_dedup_burst":
+                _emit_burst_summary(
+                    camera_id, kind, zone, burst_count, severity, mode,
+                )
+            return
+
+    # Fired path (telegram or dashboard_only): write events row + Telegram.
     snapshot_path = _snapshot_enqueue(event_id)
     payload = {
         "camera":   camera_id,
@@ -732,15 +1375,29 @@ def emit_alert(camera_id: str, kind: str, detail: dict):
         "label":    detail.get("label", kind),
         "severity": detail.get("severity", "low"),
         **detail,
-        "event_id": event_id,  # placed after **detail so callers can't clobber
+        "event_id": event_id,  # after **detail so callers can't clobber
     }
     try:
         _alert_q.put_nowait(payload)
     except queue.Full:
         log.warning("Alert queue full — dropped")
 
-    # Phase 5: dispatch Telegram notify (non-blocking, severity-filtered).
-    _dispatch_notify(event_id, camera_id, kind, detail, snapshot_path)
+    if decision_route == "telegram":
+        _dispatch_notify(
+            event_id, camera_id, kind, detail, severity, snapshot_path,
+        )
+        _audit_write(
+            event_id=event_id, camera_id=camera_id, kind=kind,
+            computed_severity=severity, mode=mode,
+            decision="fired_telegram", zone=zone,
+        )
+    else:
+        # dashboard_only — events row written, no Telegram.
+        _audit_write(
+            event_id=event_id, camera_id=camera_id, kind=kind,
+            computed_severity=severity, mode=mode,
+            decision="fired_dashboard_only", zone=zone,
+        )
 
 
 # ─────────────────────────── YOLO ─────────────────────────────────────────────
@@ -1113,6 +1770,21 @@ def draw_hud(frame, fps: float, n_tracks: int, thermal: float):
 
 # ─────────────────────────── MAIN LOOP ────────────────────────────────────────
 def run(cfg: dict):
+    # Session 5 — validate schedule + init audit DB BEFORE any worker thread
+    # so misconfigured schedules crash loudly at startup (per spec failure
+    # mode: "Better to crash than silently run in wrong mode").
+    try:
+        _validate_schedule(cfg)
+    except Exception as e:
+        log.critical("SCHEDULE INVALID — refusing to start: %s", e)
+        sys.exit(1)
+    try:
+        _audit_init()
+    except Exception as e:
+        log.critical("AUDIT INIT FAILED — refusing to start: %s", e)
+        sys.exit(1)
+    log.info("Mode at startup: %s", resolve_mode(cfg))
+
     # ── Start support services ─────────────────────────────────────────────────
     threading.Thread(target=_mqtt_worker, args=(cfg,), daemon=True, name="mqtt").start()
     start_mjpeg(cfg["mjpeg_port"])
@@ -1160,12 +1832,6 @@ def run(cfg: dict):
     # FPS rolling window
     fps_window: collections.deque = collections.deque(maxlen=30)
     last_fps_ts = time.time()
-
-    # Alert dedup
-    alert_cooldown_sec = cfg["alert_cooldown_sec"]
-    object_ttl_sec     = cfg["object_ttl_sec"]
-    next_object_id     = 1
-    active_objects:    dict = {}
 
     def _stop(sig, _):
         nonlocal running
@@ -1263,59 +1929,40 @@ def run(cfg: dict):
                     last_summary_counts = dict(class_counts)
                     last_summary_ts = now
 
-                # ── Prune stale object state ───────────────────────────────────
-                stale = [k for k,v in active_objects.items()
-                         if now - v["last_seen"] > object_ttl_sec]
-                for k in stale:
-                    active_objects.pop(k, None)
-
-                # ── Per-object events with dedup ───────────────────────────────
+                # ── Per-track detection events ─────────────────────────────────
+                # Per-object cooldown removed in Session 5 — dedup now lives in
+                # the central decision pipeline (compute_decision + three-layer
+                # filter inside emit_alert). Every track emits; the orchestrator
+                # decides what's noise.
                 for t in last_tracks:
-                    x1,y1,x2,y2 = int(t[0]),int(t[1]),int(t[2]),int(t[3])
-                    bbox = [x1,y1,x2,y2]
+                    x1, y1, x2, y2 = int(t[0]), int(t[1]), int(t[2]), int(t[3])
+                    bbox = [x1, y1, x2, y2]
 
                     if tracker is not None and len(t) > 6:
                         track_id = int(t[4]); conf = float(t[5]); cls = int(t[6])
-                        object_key = f"trk:{track_id}:{cls}"
                     else:
-                        conf = float(t[4]) if len(t)>4 else 0.0
-                        cls  = int(t[5])   if len(t)>5 else -1
+                        conf = float(t[4]) if len(t) > 4 else 0.0
+                        cls = int(t[5]) if len(t) > 5 else -1
                         track_id = -1
-                        matched_key = None; best_iou = 0.0
-                        for k, v in active_objects.items():
-                            if v["cls"] != cls: continue
-                            s = iou_xyxy(bbox, v["bbox"])
-                            if s > 0.50 and s > best_iou:
-                                matched_key = k; best_iou = s
-                        object_key = matched_key or f"obj:{next_object_id}:{cls}"
-                        if not matched_key:
-                            next_object_id += 1
 
-                    cx = int((x1+x2)/2); cy = int((y1+y2)/2)
-                    zones.update(track_id if track_id >= 0 else 0, cx, cy, cfg["camera_id"])
+                    cx = int((x1 + x2) / 2); cy = int((y1 + y2) / 2)
+                    zones.update(
+                        track_id if track_id >= 0 else 0,
+                        cx, cy, cfg["camera_id"],
+                    )
 
                     if not (0 <= cls < len(COCO_NAMES)):
                         continue
                     class_name = COCO_NAMES[cls]
 
-                    info   = active_objects.get(object_key)
-                    is_new = info is None
-                    if is_new:
-                        info = {"cls":cls,"bbox":bbox,"last_seen":now,"last_alert":0.0}
-                        active_objects[object_key] = info
-
-                    info["bbox"] = bbox; info["last_seen"] = now
-
-                    if is_new or (now - info["last_alert"] >= alert_cooldown_sec):
-                        emit_alert(cfg["camera_id"], "detection", {
-                            "class_name": class_name,
-                            "confidence": round(conf, 3),
-                            "bbox":       bbox,
-                            "track_id":   track_id if track_id >= 0 else None,
-                            "label":      f"{class_name} detected",
-                            "severity":   "medium" if class_name == "person" else "low",
-                        })
-                        info["last_alert"] = now
+                    emit_alert(cfg["camera_id"], "detection", {
+                        "class_name": class_name,
+                        "confidence": round(conf, 3),
+                        "bbox":       bbox,
+                        "track_id":   track_id if track_id >= 0 else None,
+                        "label":      f"{class_name} detected",
+                        "severity":   "medium" if class_name == "person" else "low",
+                    })
 
             # ── FACE (disabled until ORT is stable on this Jetson) ─────────────
             # if face_det and n_frame % cfg["face_every_n"] == 0: ...
