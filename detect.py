@@ -583,6 +583,12 @@ def start_thermal_monitor(cfg: dict):
 
 _replay_capture: "Optional[list]" = None  # accumulator; None means not in replay
 
+# Per-frame action labels captured by the main loop when --emit-actions is set.
+# Each entry: {"frame": n, "ts": float, "labels": {track_id: {action,
+# next_action, track_id}}}. Used by tests to assert classifier behaviour over
+# time without reading the audit DB.
+_replay_action_capture: "Optional[list]" = None
+
 
 # ─────────────────────────── MODE RESOLUTION (Session 5) ──────────────────────
 # OCCUPIED / CLOSED / MAINTENANCE — resolved at decision time from CFG schedule
@@ -2319,6 +2325,16 @@ def run(cfg: dict):
             # ── ANNOTATE + STREAM ──────────────────────────────────────────────
             vis = frame.copy()
             beh_labels = beh_analyzer.get_labels() if beh_analyzer else {}
+
+            # Replay mode: capture per-frame action labels for offline
+            # assertions. Cheap (dict copy already done by get_labels()).
+            if _replay_action_capture is not None and beh_labels:
+                _replay_action_capture.append({
+                    "frame":  n_frame,
+                    "ts":     now,
+                    "labels": beh_labels,
+                })
+
             draw_forbidden_zones(vis, forbidden.all_polys())
             draw_tracks(vis, last_tracks)
             if beh_analyzer:
@@ -2354,7 +2370,7 @@ def run(cfg: dict):
             f"Pipeline stopped — frames={n_frame} alerts={_health['alerts_total']}"
             f" uptime={_health['uptime_s']}s"
         )
-        # Dump replay capture if requested.
+        # Dump replay decision capture if requested.
         out_path = cfg.get("replay_emit_json")
         if _replay_capture is not None and out_path:
             try:
@@ -2365,6 +2381,19 @@ def run(cfg: dict):
                 )
             except Exception as e:
                 log.error("REPLAY: failed to write %s: %s", out_path, e)
+        # Dump per-frame action capture if requested.
+        actions_path = cfg.get("replay_emit_actions")
+        if _replay_action_capture is not None and actions_path:
+            try:
+                Path(actions_path).write_text(
+                    json.dumps(_replay_action_capture, indent=2)
+                )
+                log.info(
+                    "REPLAY: wrote %d action frame(s) to %s",
+                    len(_replay_action_capture), actions_path,
+                )
+            except Exception as e:
+                log.error("REPLAY: failed to write %s: %s", actions_path, e)
 
 
 def main() -> None:
@@ -2392,6 +2421,12 @@ def main() -> None:
              "mode, decision, ...) to this JSON file on exit.",
     )
     parser.add_argument(
+        "--emit-actions", dest="emit_actions", metavar="PATH",
+        help="Replay only: write per-frame behavior action labels (track_id "
+             "→ {action, next_action}) to this JSON file on exit. Used by "
+             "the classifier-accuracy regression tests.",
+    )
+    parser.add_argument(
         "--mode", choices=list(_VALID_MODES),
         help="Force resolve_mode to return this value, bypassing the "
              "schedule. Useful for replay tests that need deterministic "
@@ -2400,13 +2435,16 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.replay:
-        global _replay_capture
+        global _replay_capture, _replay_action_capture
         _replay_capture = []
+        if args.emit_actions:
+            _replay_action_capture = []
         CFG["rtsp_url"] = args.replay
         CFG["replay_mode"] = True
         CFG["replay_emit_json"] = args.emit_json
-    elif args.emit_json:
-        parser.error("--emit-json requires --replay")
+        CFG["replay_emit_actions"] = args.emit_actions
+    elif args.emit_json or args.emit_actions:
+        parser.error("--emit-json / --emit-actions requires --replay")
 
     if args.mode:
         CFG["replay_force_mode"] = args.mode

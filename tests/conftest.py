@@ -68,19 +68,24 @@ def _run_replay(
     out_json: Path,
     mode: str = "OCCUPIED",
     timeout_s: int = 180,
+    out_actions: Optional[Path] = None,
 ) -> subprocess.CompletedProcess:
     """Subprocess-launch detect.py in replay mode.
 
-    Uses DB_PATH env var to scope the audit DB to this test only.
+    Uses DB_PATH env var to scope the audit DB to this test only. If
+    out_actions is given, also captures per-frame action labels.
     """
     env = {**os.environ, "DB_PATH": str(db_path)}
+    cmd = [
+        sys.executable, str(DETECT_PY),
+        "--replay", str(clip_path),
+        "--emit-json", str(out_json),
+        "--mode", mode,
+    ]
+    if out_actions is not None:
+        cmd.extend(["--emit-actions", str(out_actions)])
     return subprocess.run(
-        [
-            sys.executable, str(DETECT_PY),
-            "--replay", str(clip_path),
-            "--emit-json", str(out_json),
-            "--mode", mode,
-        ],
+        cmd,
         env=env,
         capture_output=True,
         text=True,
@@ -91,21 +96,28 @@ def _run_replay(
 
 @pytest.fixture
 def replay_runner(tmp_path):
-    """Returns a callable: (clip, polygon=None, mode='OCCUPIED') -> decisions list.
+    """Returns a callable: (clip, polygon=None, mode=..., capture_actions=False).
+
+    Returns the parsed JSON list of decisions emitted during replay. When
+    capture_actions=True, also returns the per-frame action labels as a
+    second element (i.e., (decisions, actions)). When False, just decisions.
 
     polygon: if provided, inserted into the test forbidden_zones table.
-    Returns the parsed JSON list of decisions emitted during replay.
     """
 
     def run(
         clip: Path,
         polygon: Optional[list] = None,
         mode: str = "OCCUPIED",
-    ) -> list:
+        capture_actions: bool = False,
+    ):
         db = tmp_path / "test.db"
         out = tmp_path / "decisions.json"
+        actions = tmp_path / "actions.json" if capture_actions else None
         _bootstrap_test_db(db, forbidden_polygon=polygon)
-        result = _run_replay(clip, db, out, mode=mode)
+        result = _run_replay(
+            clip, db, out, mode=mode, out_actions=actions,
+        )
         if result.returncode != 0:
             pytest.fail(
                 f"detect.py replay exited {result.returncode}\n"
@@ -117,6 +129,10 @@ def replay_runner(tmp_path):
                 f"emit-json output missing: {out}\n"
                 f"--- stderr ---\n{result.stderr[-2000:]}"
             )
-        return json.loads(out.read_text())
+        decisions = json.loads(out.read_text())
+        if capture_actions:
+            actions_data = json.loads(actions.read_text()) if actions.exists() else []
+            return decisions, actions_data
+        return decisions
 
     return run

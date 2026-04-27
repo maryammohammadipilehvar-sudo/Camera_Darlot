@@ -93,6 +93,11 @@ seconds on the Jetson.
 - Audit-log writer breakage (decisions only reach the JSON via
   `_audit_write`; if the writer dies silently, the dump is empty and
   tests fail).
+- **Behavior classifier regressions** — `--emit-actions` captures
+  per-frame action labels; `test_action_labels_are_valid_enum_members`
+  asserts every label is a member of the `Action` enum. Catches the
+  Session 8 class of bug where a rule returned a stray string instead
+  of an enum value.
 
 What they don't catch:
 - YOLO inference correctness (deterministic but not asserted on bbox
@@ -101,3 +106,24 @@ What they don't catch:
 - Telegram delivery (replay disables the notifier).
 - Dashboard rendering (frontend is out of scope here; live tests via
   browser still required).
+- **Classifier accuracy.** We assert *validity* of action labels but
+  not whether the right one fires for a given posture. Next session:
+  add ground-truth-labeled action clips so a classifier-tuning sweep
+  is measurable.
+
+## Inspecting the classifier directly
+
+`--emit-actions PATH` writes a JSON timeline of every per-frame action
+label seen during replay. Useful for debugging the rule-based
+classifier or comparing it against a learned replacement:
+
+```bash
+source .venv/bin/activate
+python3 detect.py --replay tests/corpus/clip_01_forbidden_breach.mp4 \
+                  --emit-json /tmp/decisions.json \
+                  --emit-actions /tmp/actions.json \
+                  --mode OCCUPIED
+jq '.[] | {frame, labels}' /tmp/actions.json | head -40
+```
+
+Each entry: `{frame: int, ts: float, labels: {track_id: {action, next_action, track_id}}}`.

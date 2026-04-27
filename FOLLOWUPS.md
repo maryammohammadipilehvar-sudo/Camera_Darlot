@@ -345,26 +345,26 @@ Product impact: without this, Telegram notifications become noise
 and admins turn them off — defeating the whole Session 4 build-out.
 Session 5 candidate, probably the highest-value next task.
 
-### Behavior classifier mislabels standing as sitting (MEDIUM)
+### Behavior classifier mislabels standing as sitting (MEDIUM — partial fix)
 
-Session 4 Phase 5 foreground test showed the YOLOv8-pose + behavior
-classifier labeling a clearly-standing person as "sitting" across
-multiple frames. Model-quality issue, not pipeline wiring.
+**PARTIAL FIX (Session 8).** Three structural problems flagged
+here have been addressed:
 
-Overlaps with AUDIT Risk #5 (duplicate "sitting" rule blocks in
-`behavior.py:167-177` with different thresholds — the loose block
-is unreachable today but the strict block's thresholds may also be
-too loose). Start there: tighten the torso-ratio / knee-hip-gap
-thresholds on the strict rule, or replace rule-based with a proper
-classifier head.
+1. The unreachable duplicate sitting block at `behavior.py:167-177`
+   has been deleted.
+2. `Action.SITTING` is now a member of the enum, registered in
+   `_TRANSITIONS`, `ACTION_COLORS`, and `_ROUTINE_ACTIONS` (so the
+   overlay correctly skips it as routine).
+3. Strict-sitting `knee_hip_gap` threshold tightened from 0.22 →
+   0.15 to reduce the standing-misclassified-as-sitting rate that
+   was observed when keypoint detection was incomplete.
 
-Also: `"sitting"` is not a member of the `Action` enum — the string
-leaks through and downstream Markov `_TRANSITIONS` and alert logic
-fall through to `UNKNOWN`. Either add `Action.SITTING` or fold
-sitting into the existing `CROUCHING` action.
-
-Requires separate investigation (threshold sweep, possibly
-retraining). Not suitable for a single short session.
+What remains: a quantitative threshold sweep against ground-truth
+labels. The replay harness now captures per-frame action labels
+via `--emit-actions` (Session 8); next iteration is a labeled
+corpus + accuracy regression test that drives further tuning.
+Possibly a learned classifier (small MLP on keypoint statistics)
+if the rule-based approach plateaus.
 
 ### Debug overlay leak in behavior.py / draw_behavior (LOW)
 

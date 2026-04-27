@@ -51,6 +51,9 @@ class Action:
     STANDING   = "standing"
     WALKING    = "walking"
     RUNNING    = "running"
+    SITTING    = "sitting"       # added Session 8 — was leaking as a stray
+                                  # string, breaking Markov transitions and
+                                  # overlay routing
     CROUCHING  = "crouching"
     FALLEN     = "fallen"
     RAISING    = "raising_arm"   # arms above shoulders
@@ -59,9 +62,10 @@ class Action:
 
 # Transition map used for next-action prediction (simple Markov)
 _TRANSITIONS: Dict[str, List[Tuple[str, float]]] = {
-    Action.STANDING:  [(Action.WALKING, .45), (Action.STANDING, .40), (Action.CROUCHING, .10), (Action.RUNNING, .05)],
+    Action.STANDING:  [(Action.WALKING, .40), (Action.STANDING, .35), (Action.SITTING, .10), (Action.CROUCHING, .10), (Action.RUNNING, .05)],
     Action.WALKING:   [(Action.WALKING, .50), (Action.STANDING, .25), (Action.RUNNING, .20), (Action.CROUCHING, .05)],
     Action.RUNNING:   [(Action.RUNNING, .50), (Action.WALKING, .35), (Action.STANDING, .15)],
+    Action.SITTING:   [(Action.SITTING, .65), (Action.STANDING, .30), (Action.CROUCHING, .05)],
     Action.CROUCHING: [(Action.CROUCHING, .40), (Action.STANDING, .35), (Action.WALKING, .20), (Action.FALLEN, .05)],
     Action.FALLEN:    [(Action.FALLEN, .70), (Action.CROUCHING, .20), (Action.STANDING, .10)],
     Action.RAISING:   [(Action.STANDING, .50), (Action.RAISING, .30), (Action.WALKING, .20)],
@@ -168,19 +172,16 @@ class ActionClassifier:
             total_h = max(h, 1)
             torso_ratio = torso_h / total_h
 
-            # Sitting: hips close to knees, torso still visible
+            # Sitting: hips close to knees (knees visually level with hips
+            # in the bbox), torso still visible, body still. The knee-hip
+            # gap is the key differentiator vs standing — standing has
+            # knees well below hips (~30-40% of bbox height); sitting
+            # collapses that. Threshold tightened from 0.22 → 0.15 to
+            # stop standing-with-incomplete-keypoints from misfiring as
+            # sitting (audit-flagged false positive).
             knee_hip_gap = abs(kne_y - hip_y) / total_h
-            if torso_ratio >= 0.18 and knee_hip_gap < 0.22 and speed < 0.08:
-                return "sitting"
-
-            # Sitting: auto rule
-
-            knee_hip_gap = abs(kne_y - hip_y) / total_h
-
-            if 0.16 <= torso_ratio <= 0.60 and knee_hip_gap < 0.42 and speed < 0.14:
-
-                return "sitting"
-
+            if torso_ratio >= 0.18 and knee_hip_gap < 0.15 and speed < 0.08:
+                return Action.SITTING
 
             # Crouching: torso compressed and knees near hip level
             if torso_ratio < 0.25 and abs(kne_y - hip_y) < 0.15 * total_h:
@@ -461,6 +462,7 @@ ACTION_COLORS = {
     Action.STANDING:  (0,   220,  80),
     Action.WALKING:   (0,   180, 255),
     Action.RUNNING:   (0,   100, 255),
+    Action.SITTING:   (140, 200, 140),
     Action.CROUCHING: (60,  200, 255),
     Action.FALLEN:    (0,     0, 255),
     Action.RAISING:   (255, 180,   0),
@@ -470,7 +472,8 @@ ACTION_COLORS = {
 
 # Actions considered routine — no overlay drawn so the annotated frame
 # stays uncluttered. Anything else gets a Title-Case word in ACTION_COLORS.
-_ROUTINE_ACTIONS = {Action.STANDING, Action.WALKING, Action.UNKNOWN}
+# SITTING is routine in a warehouse context (operators at desks) — no overlay.
+_ROUTINE_ACTIONS = {Action.STANDING, Action.WALKING, Action.SITTING, Action.UNKNOWN}
 
 _ACTION_DISPLAY = {
     Action.RUNNING:   "Running",

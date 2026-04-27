@@ -11,12 +11,28 @@ be exercised without operator intervention.
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from conftest import CORPUS_DIR
+from conftest import CORPUS_DIR, REPO_ROOT
+
+
+# Make detect.py + behavior.py importable so tests can validate captured
+# action strings against the canonical Action enum.
+sys.path.insert(0, str(REPO_ROOT))
+from behavior import Action  # noqa: E402
+
+# Set of every legal action label; tests use this to catch any stray
+# string regressions (the bug we just fixed where "sitting" leaked
+# bare instead of going through Action.SITTING).
+_ALLOWED_ACTIONS = {
+    Action.UNKNOWN, Action.STANDING, Action.WALKING, Action.RUNNING,
+    Action.SITTING, Action.CROUCHING, Action.FALLEN, Action.RAISING,
+    Action.FIGHTING,
+}
 
 
 # Right-third-of-frame polygon, matching the "Test Zone" docs/operator
@@ -118,6 +134,46 @@ def test_clip_02_routine_outside_zone(replay_runner):
     fired_anything = [d for d in decisions if d["decision"].startswith("fired_")]
     assert not fired_anything, (
         f"non-forbidden_zone fires leaked past the gate: {fired_anything}"
+    )
+
+
+def test_action_labels_are_valid_enum_members(replay_runner):
+    """Every action emitted by the behavior classifier must be a member of
+    the Action enum. Catches regressions where a rule returns a stray
+    string (e.g., the duplicate sitting block we removed in Session 8) —
+    that would break Markov transitions, ACTION_COLORS lookups, and the
+    routine-overlay filter without any compile-time signal.
+
+    Uses clip_01 because it has actual people in motion. Skips otherwise.
+    """
+    clip = _require_clip("clip_01_forbidden_breach.mp4")
+    decisions, actions = replay_runner(
+        clip, polygon=RIGHT_THIRD, capture_actions=True,
+    )
+
+    if not actions:
+        pytest.skip(
+            "No action labels captured — pose model may have failed to "
+            "load. Check the pipeline's behavior-analyzer warmup logs."
+        )
+
+    seen = set()
+    for frame in actions:
+        for tid, info in (frame.get("labels") or {}).items():
+            for key in ("action", "next_action"):
+                val = info.get(key)
+                if val is None:
+                    continue
+                seen.add(val)
+                assert val in _ALLOWED_ACTIONS, (
+                    f"frame {frame.get('frame')} track {tid} {key}={val!r} "
+                    f"is not a member of Action enum (allowed: {_ALLOWED_ACTIONS})"
+                )
+
+    # Sanity: should have seen at least one non-UNKNOWN label across the
+    # whole clip, otherwise the classifier never engaged.
+    assert seen - {Action.UNKNOWN}, (
+        f"Classifier only ever produced UNKNOWN. Labels seen: {seen}"
     )
 
 
