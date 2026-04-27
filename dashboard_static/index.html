@@ -427,7 +427,9 @@ td.trunc{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     <div class="modal-scroll">
       <div class="modal-facts" id="modal-facts"></div>
       <div class="modal-evidence">
-        <div class="modal-evidence-txt">No snapshot captured</div>
+        <img id="modal-evidence-img" class="modal-evidence-img"
+             alt="Event snapshot" style="display:none; max-width:100%; border-radius:4px">
+        <div class="modal-evidence-txt" id="modal-evidence-txt">No snapshot captured</div>
       </div>
       <details class="modal-dev">
         <summary>Developer details</summary>
@@ -633,6 +635,7 @@ function summary(ev){
   if(ev.kind==='loitering') return det.zone ? `Loitering detected in ${det.zone}` : 'Loitering detected';
   if(ev.kind==='audio') return det.class ? `Audio alert: ${det.class}` : 'Audio alert';
   if(ev.kind==='anomaly') return 'Anomaly detected';
+  if(ev.kind==='behavior') return det.label || `Behavior: ${det.action || 'unknown'}`;
   return ev.kind || 'event';
 }
 function pill(id,ok){
@@ -1015,6 +1018,22 @@ function openModal(evStr){
     'Camera ' + cam + '   ·   ' + timeTxt;
   document.getElementById('modal-facts').innerHTML = factsHtml;
   document.getElementById('modal-dev-json').textContent = JSON.stringify(obj, null, 2);
+
+  // Snapshot evidence — show the JPEG if the server has one, else the
+  // "No snapshot captured" placeholder remains visible.
+  const img = document.getElementById('modal-evidence-img');
+  const txt = document.getElementById('modal-evidence-txt');
+  if(img && txt){
+    img.style.display = 'none';
+    txt.style.display = '';
+    if(obj.id != null){
+      img.onload = () => { img.style.display = ''; txt.style.display = 'none'; };
+      img.onerror = () => { img.style.display = 'none'; txt.style.display = ''; };
+      img.src = `/api/events/${obj.id}/snapshot`;
+    } else {
+      img.removeAttribute('src');
+    }
+  }
 
   // Collapse developer details on each open so repeat-clicks don't preserve state.
   const dev = document.querySelector('.modal-dev');

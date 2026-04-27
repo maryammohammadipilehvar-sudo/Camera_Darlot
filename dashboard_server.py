@@ -27,8 +27,8 @@ from typing import Optional
 
 import paho.mqtt.client as mqtt
 import uvicorn
-from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi import FastAPI, Query, Response, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 
 # ── Config ────────────────────────────────────────────────────────────────────
 MQTT_HOST   = os.getenv("MQTT_HOST",   "localhost")
@@ -39,6 +39,9 @@ STREAM_PORT = int(os.getenv("STREAM_PORT", "8080"))
 DASH_PORT   = int(os.getenv("DASH_PORT",   "8888"))
 DB_PATH     = os.getenv("DB_PATH", str(
     Path(__file__).parent / "sentinel_events.db"
+))
+SNAPSHOT_DIR = Path(os.path.expanduser(
+    os.getenv("SNAPSHOT_DIR", "~/.local/share/darlot/snapshots")
 ))
 STATIC_DIR  = Path(__file__).parent / "dashboard_static"
 
@@ -210,6 +213,12 @@ def format_event_for_ui(event: dict) -> dict:
 
     elif kind == "anomaly":
         summary = "Anomaly detected"
+
+    elif kind == "behavior":
+        summary = str(
+            detail.get("label")
+            or f"Behavior: {detail.get('action', 'unknown')}"
+        )
 
     event["detail"] = detail
     event["display_time"] = display_time
@@ -413,6 +422,46 @@ def api_events(
         "limit": limit,
         "offset": offset
     }
+
+@app.get("/api/events/{event_id}/snapshot")
+def api_event_snapshot(event_id: int):
+    """Serve the JPEG snapshot captured when this event fired.
+
+    Looks up the events row, reads the monotonic event id from
+    ``detail.event_id`` (stamped by emit_alert in detect.py), and
+    returns the matching JPEG from SNAPSHOT_DIR. Snapshot filenames
+    are ``<start_epoch>_<monotonic_id>.jpg``; the start_epoch prefix
+    differs per pipeline restart, so we glob by suffix.
+
+    404 if the events row, the monotonic id, or the file is missing.
+    """
+    try:
+        row = _conn().execute(
+            "SELECT detail FROM events WHERE id=?", (event_id,)
+        ).fetchone()
+    except Exception as e:
+        log.warning(f"snapshot db lookup failed event_id={event_id}: {e}")
+        return Response(status_code=404)
+    if not row:
+        return Response(status_code=404)
+    try:
+        detail = json.loads(row["detail"]) if isinstance(row["detail"], str) else (row["detail"] or {})
+    except Exception:
+        return Response(status_code=404)
+    monotonic_id = detail.get("event_id")
+    if not isinstance(monotonic_id, int):
+        return Response(status_code=404)
+    if not SNAPSHOT_DIR.is_dir():
+        return Response(status_code=404)
+    matches = sorted(SNAPSHOT_DIR.glob(f"*_{monotonic_id}.jpg"))
+    if not matches:
+        return Response(status_code=404)
+    return FileResponse(
+        matches[-1],  # most recent if multiple epochs collide
+        media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
 
 @app.get("/api/stats")
 def api_stats():

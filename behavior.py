@@ -93,6 +93,11 @@ class TrackWindow:
         self.last_update = time.time()
 
     def should_alert(self, action: str, cooldown: float = 10.0) -> bool:
+        # NOTE: Duplicates the central track/zone/burst dedup in detect.py.
+        # Both are needed today because behavior.py runs in its own thread
+        # and short-circuits before emit_alert (the central dedup only runs
+        # on the telegram path). Consolidate in a future session — see
+        # FOLLOWUPS entry on duplicate dedup systems.
         now = time.time()
         if now - self.alert_ts.get(action, 0) >= cooldown:
             self.alert_ts[action] = now
@@ -364,27 +369,28 @@ class BehaviorAnalyzer:
                 }
 
                 # ── Alert logic ────────────────────────────────────────────────
+                # Severity is now set centrally by compute_severity in
+                # detect.py from the severity_table — do not pass a
+                # `severity` hint in detail (that would trip the dashboard
+                # severityOf upgrade-magic; see FOLLOWUPS entry).
                 if self._emit_fn:
-                    if action == Action.FALLEN and w.should_alert(Action.FALLEN, 15.0):
+                    if action == Action.FALLEN and w.should_alert(Action.FALLEN, 60.0):
                         self._emit_fn(self._camera_id, "behavior", {
                             "action":   "fallen",
                             "track_id": track_id,
                             "label":    f"Person #{track_id} may have fallen",
-                            "severity": "high",
                         })
-                    elif action == Action.FIGHTING and w.should_alert(Action.FIGHTING, 10.0):
+                    elif action == Action.FIGHTING and w.should_alert(Action.FIGHTING, 60.0):
                         self._emit_fn(self._camera_id, "behavior", {
                             "action":   "fighting",
                             "track_id": track_id,
                             "label":    f"Aggressive movement #{track_id}",
-                            "severity": "high",
                         })
-                    elif action == Action.RUNNING and w.should_alert(Action.RUNNING, 20.0):
+                    elif action == Action.RUNNING and w.should_alert(Action.RUNNING, 120.0):
                         self._emit_fn(self._camera_id, "behavior", {
                             "action":   "running",
                             "track_id": track_id,
                             "label":    f"Person #{track_id} running",
-                            "severity": "medium",
                         })
 
             with self._lock:

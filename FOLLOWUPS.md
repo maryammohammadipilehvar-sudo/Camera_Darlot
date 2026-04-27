@@ -4,6 +4,24 @@ Deferred work captured from audits and verification runs. Items here are
 intentionally not blocking the current change; each entry notes urgency and
 sufficient context to pick up in a future session.
 
+### Behavior pipeline duplicates the central dedup (LOW)
+
+`behavior.py:should_alert` runs a per-track, per-action cooldown
+(60/60/120s as of 2026-04-27) that gates whether `emit_alert` is
+called at all. The central three-layer dedup in `detect.py`
+(`_dedup_filter`) only runs on the telegram path inside
+`emit_alert`, so behavior emits that route to dashboard_only bypass
+the central system entirely.
+
+Two dedup systems for the same noise problem. Consolidate so all
+throttling lives in `detect.py`'s `_dedup_filter` once the behavior
+emit path is unified with detection — likely means moving the
+should_alert gate either out of behavior.py or into the central
+dedup with a "kind=behavior, dashboard_only" allowance.
+
+Low urgency — works correctly today, just two places to reason
+about when tuning rates.
+
 ### Track dedup over-suppresses sustained presence (HIGH)
 
 Session 5 foreground test (2026-04-27, 13:05–13:08, CLOSED mode):

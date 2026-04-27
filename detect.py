@@ -159,6 +159,14 @@ CFG = {
         "thermal":            {"OCCUPIED": "HIGH",     "CLOSED": "HIGH",     "MAINTENANCE": "HIGH"},
         "thermal:fire":       {"OCCUPIED": "CRITICAL", "CLOSED": "CRITICAL", "MAINTENANCE": "CRITICAL"},
         "anomaly":            {"OCCUPIED": "HIGH",     "CLOSED": "CRITICAL", "MAINTENANCE": "HIGH"},
+        # Behavior subtypes — pinned LOW × OCCUPIED until classifier
+        # mislabeling is addressed (see FOLLOWUPS entry on classifier).
+        # CLOSED bumps the alarming subtypes to MEDIUM so they reach
+        # Telegram at night.
+        "behavior":           {"OCCUPIED": "INFO",     "CLOSED": "LOW",      "MAINTENANCE": "INFO"},
+        "behavior:fallen":    {"OCCUPIED": "LOW",      "CLOSED": "MEDIUM",   "MAINTENANCE": "LOW"},
+        "behavior:fighting":  {"OCCUPIED": "LOW",      "CLOSED": "MEDIUM",   "MAINTENANCE": "LOW"},
+        "behavior:running":   {"OCCUPIED": "LOW",      "CLOSED": "LOW",      "MAINTENANCE": "LOW"},
     },
 
     # ── Notification thresholds (Session 5) ───────────────────────
@@ -670,6 +678,15 @@ def _subtype_of(kind: str, detail: dict) -> str:
         # No fire classifier yet; keep entry forward-compatible.
         if str(detail.get("fire") or "").lower() in ("1", "true", "yes"):
             return "fire"
+        return ""
+    if k == "behavior":
+        # Subtype is the pose-classifier action label. Map only the
+        # alarming actions to severity-table rows; anything else
+        # (standing, walking, unknown) falls through to the bare
+        # "behavior" row → INFO/OCCUPIED → suppressed.
+        action = str(detail.get("action") or "").lower()
+        if action in ("fallen", "fighting", "running"):
+            return action
         return ""
     return ""
 
