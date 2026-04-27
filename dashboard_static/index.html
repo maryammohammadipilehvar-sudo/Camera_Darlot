@@ -940,21 +940,30 @@ function esc(ev){
   return JSON.stringify(JSON.stringify(ev));  // double-encode for onclick attr
 }
 
-// Map event → severity key. Backend (compute_severity in detect.py) is the
-// source of truth: emit_alert stamps the lowercase computed severity into
-// the events row. The previous "high → critical / medium → high" upgrade
-// has been retired now that the backend severity is honest.
+// Map event → severity key.
 //
-// Falls back to a kind-based guess only when detail.severity is missing or
-// unrecognisable — defensive coverage for legacy rows or future event kinds.
+// Order of precedence:
+//   1. Mode-invariant kinds — kind alone is authoritative regardless of
+//      what detail.severity says. Protects against legacy rows where
+//      detail.severity carries a stale operator hint (default "low") not
+//      the computed truth. Backend stamps the computed value going
+//      forward; this layer makes the dashboard right for old data too.
+//   2. detail.severity if recognisable — backend stamps it with the
+//      computed value (commit 265f44b).
+//   3. Kind-based fallback — defensive for legacy / future kinds.
 function severityOf(ev){
   const det = ev.detail || {};
+  const kind = ev.kind || ev.display_kind || '';
+
+  // (1) Mode-invariant kinds: severity is fixed in the backend table.
+  if(kind === 'forbidden_zone') return 'critical';
+
+  // (2) Trust the stamped severity for everything else.
   const raw = String(det.severity || '').toLowerCase();
   if(raw === 'critical' || raw === 'high' || raw === 'medium' ||
      raw === 'low' || raw === 'info') return raw;
 
-  const kind = ev.kind || ev.display_kind || '';
-  if(kind === 'forbidden_zone') return 'critical';
+  // (3) Fallback for legacy events where detail.severity is missing.
   if(kind === 'anomaly' || kind === 'thermal') return 'high';
   if(kind === 'audio'){
     const c = String(det.class || '').toLowerCase();
