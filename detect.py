@@ -148,7 +148,7 @@ CFG = {
     # Maps "<kind>" or "<kind>:<subtype>" → {mode: severity}.
     # PUBLIC zone only this session — every event treated as zone="main".
     "severity_table": {
-        "detection":          {"OCCUPIED": "INFO",     "CLOSED": "HIGH",     "MAINTENANCE": "INFO"},
+        "detection":          {"OCCUPIED": "MEDIUM",   "CLOSED": "HIGH",     "MAINTENANCE": "INFO"},
         "detection_summary":  {"OCCUPIED": "INFO",     "CLOSED": "LOW",      "MAINTENANCE": "INFO"},
         "loitering":          {"OCCUPIED": "LOW",      "CLOSED": "HIGH",     "MAINTENANCE": "LOW"},
         "face_match:known":   {"OCCUPIED": "INFO",     "CLOSED": "LOW",      "MAINTENANCE": "INFO"},
@@ -167,7 +167,7 @@ CFG = {
     "thresholds": {
         "CRITICAL": {"OCCUPIED": "telegram",   "CLOSED": "telegram",   "MAINTENANCE": "telegram"},
         "HIGH":     {"OCCUPIED": "telegram",   "CLOSED": "telegram",   "MAINTENANCE": "dashboard"},
-        "MEDIUM":   {"OCCUPIED": "dashboard",  "CLOSED": "telegram",   "MAINTENANCE": "suppressed"},
+        "MEDIUM":   {"OCCUPIED": "telegram",   "CLOSED": "telegram",   "MAINTENANCE": "suppressed"},
         "LOW":      {"OCCUPIED": "dashboard",  "CLOSED": "dashboard",  "MAINTENANCE": "suppressed"},
         "INFO":     {"OCCUPIED": "suppressed", "CLOSED": "dashboard",  "MAINTENANCE": "suppressed"},
     },
