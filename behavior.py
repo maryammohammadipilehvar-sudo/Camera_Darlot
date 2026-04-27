@@ -462,8 +462,26 @@ ACTION_COLORS = {
     Action.UNKNOWN:   (120, 120, 120),
 }
 
+# Actions considered routine — no overlay drawn so the annotated frame
+# stays uncluttered. Anything else gets a Title-Case word in ACTION_COLORS.
+_ROUTINE_ACTIONS = {Action.STANDING, Action.WALKING, Action.UNKNOWN}
+
+_ACTION_DISPLAY = {
+    Action.RUNNING:   "Running",
+    Action.FALLEN:    "Falling",
+    Action.CROUCHING: "Crouching",
+    Action.RAISING:   "Hands raised",
+    Action.FIGHTING:  "Fighting",
+}
+
+
 def draw_behavior(frame: np.ndarray, tracks: np.ndarray, labels: Dict[int, dict]):
-    """Overlay action labels on annotated frame."""
+    """Overlay action labels for non-routine behavior only.
+
+    Routine actions (standing / walking / unknown) get NO overlay so the
+    annotated frame stays readable. Non-routine actions render with the
+    ACTION_COLORS-driven color and a Title-Case word.
+    """
     if not labels or tracks is None or len(tracks) == 0:
         return
     for t in tracks:
@@ -473,11 +491,11 @@ def draw_behavior(frame: np.ndarray, tracks: np.ndarray, labels: Dict[int, dict]
         info = labels.get(tid)
         if not info:
             continue
+        action = info.get("action")
+        if not action or action in _ROUTINE_ACTIONS:
+            continue
         x1, y2 = int(t[0]), int(t[3])
-        action = info.get("action", "?")
-        nxt    = info.get("next_action", "?")
-        color  = ACTION_COLORS.get(action, (200, 200, 200))
-
-        action = str(action).split("???")[0].strip() if action else "unknown"
-        cv2.putText(frame, action, (x1, y2+15),
+        color = ACTION_COLORS.get(action, (200, 200, 200))
+        text  = _ACTION_DISPLAY.get(action, str(action).title())
+        cv2.putText(frame, text, (x1, y2+15),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)

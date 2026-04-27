@@ -1721,27 +1721,25 @@ def iou_xyxy(a, b):
     ub = max(0,bx2-bx1)*max(0,by2-by1)
     return inter / (ua+ub-inter+1e-6)
 
-def draw_tracks(frame, tracks, behavior_labels=None):
+def draw_tracks(frame, tracks):
+    """Draw bounding box + class/track/confidence label per track.
+
+    Behavior overlays are owned by ``behavior.draw_behavior`` and rendered
+    separately below the bbox; this function never reads the behavior
+    label dict.
+    """
     if tracks is None or len(tracks) == 0:
         return
     for t in tracks:
-        x1,y1,x2,y2 = int(t[0]),int(t[1]),int(t[2]),int(t[3])
+        x1, y1, x2, y2 = int(t[0]), int(t[1]), int(t[2]), int(t[3])
         tid  = int(t[4])
         cls  = int(t[6]) if len(t) > 6 else -1
         conf = float(t[5]) if len(t) > 5 else 0.0
         c    = _color(tid)
         name = COCO_NAMES[cls] if 0 <= cls < len(COCO_NAMES) else "?"
 
-        behavior = None
-        if isinstance(behavior_labels, dict):
-            behavior = behavior_labels.get(tid)
-
-        if behavior:
-            lbl = _clean_behavior_label(f"{behavior}")
-        else:
-            lbl = _clean_behavior_label(f"{name} #{tid} {conf:.0%}")
-
-        cv2.rectangle(frame, (x1,y1), (x2,y2), c, 2)
+        lbl = f"{name} #{tid} {conf:.0%}"
+        cv2.rectangle(frame, (x1, y1), (x2, y2), c, 2)
         cv2.putText(frame, lbl, (x1, y1-6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, c, 1, cv2.LINE_AA)
 
@@ -1973,7 +1971,7 @@ def run(cfg: dict):
             # ── ANNOTATE + STREAM ──────────────────────────────────────────────
             vis = frame.copy()
             beh_labels = beh_analyzer.get_labels() if beh_analyzer else {}
-            draw_tracks(vis, last_tracks, beh_labels)
+            draw_tracks(vis, last_tracks)
             if beh_analyzer:
                 try:
                     from behavior import draw_behavior
