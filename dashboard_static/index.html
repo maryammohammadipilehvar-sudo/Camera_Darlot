@@ -661,7 +661,15 @@ function fmtUp(s){
   return h+'h '+String(m).padStart(2,'0')+'m';
 }
 function summary(ev){
-  if(ev.display_summary) return ev.display_summary;
+  // Trust the server-rendered display_summary except when it's the
+  // literal "Unknown event" placeholder — that means the server didn't
+  // recognise the kind (legacy events from before format_event_for_ui
+  // learned this kind, or an old dashboard service that hasn't picked
+  // up the latest code). Fall through to the JS kind-branch logic so we
+  // still produce a useful title.
+  if(ev.display_summary && ev.display_summary !== 'Unknown event'){
+    return ev.display_summary;
+  }
   const det = typeof ev.detail==='string' ? tryParse(ev.detail) : ev.detail;
   if(!det) return '';
   if(ev.kind==='detection_summary' && det.label) return det.label;
@@ -1692,7 +1700,10 @@ document.addEventListener('DOMContentLoaded',()=>{
   initControls();
   connectWS();
   fetchStats();
-  fetchFeed();
+  // Live-events panel intentionally starts empty: it only fills from new
+  // WebSocket events after page load. Historical events live in the
+  // History tab (fetchHist below). fetchFeed() retained as a function
+  // for the manual-refresh button if/when one lands.
   fetchHist();
   setInterval(tick,1000);
   setInterval(fetchStats,30000);
