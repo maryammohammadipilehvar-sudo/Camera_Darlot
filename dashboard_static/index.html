@@ -356,8 +356,6 @@ td.trunc{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .modal-scroll::-webkit-scrollbar{width:4px}
 .modal-scroll::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px}
 
-.modal-facts{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:16px}
-@media (max-width:560px){.modal-facts{grid-template-columns:repeat(2,1fr)}}
 .mfact{background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);
   padding:8px 10px;min-width:0}
 .mfact-l{font-size:9px;letter-spacing:1.5px;color:var(--text3);font-weight:600;
@@ -366,6 +364,13 @@ td.trunc{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   text-overflow:ellipsis;white-space:nowrap}
 .mfact-empty{grid-column:1/-1;color:var(--text3);font-size:11px;font-style:italic;
   padding:6px 2px}
+
+.modal-human{margin:0 0 16px;padding:0;display:grid;
+  grid-template-columns:max-content 1fr;column-gap:14px;row-gap:6px}
+.modal-human dt{font-size:11px;letter-spacing:1.2px;color:var(--text3);
+  font-weight:500;text-transform:uppercase;margin:0}
+.modal-human dd{font-size:13px;color:var(--text);margin:0;
+  overflow-wrap:anywhere}
 
 .modal-evidence{background:var(--bg);border:1px solid var(--border);border-radius:6px;
   aspect-ratio:16/9;display:flex;align-items:center;justify-content:center;
@@ -425,14 +430,14 @@ td.trunc{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     <div class="modal-headline" id="modal-headline"></div>
     <div class="modal-sub" id="modal-sub"></div>
     <div class="modal-scroll">
-      <div class="modal-facts" id="modal-facts"></div>
       <div class="modal-evidence">
         <img id="modal-evidence-img" class="modal-evidence-img"
              alt="Event snapshot" style="display:none; max-width:100%; border-radius:4px">
         <div class="modal-evidence-txt" id="modal-evidence-txt">No snapshot captured</div>
       </div>
+      <dl class="modal-human" id="modal-human"></dl>
       <details class="modal-dev">
-        <summary>Developer details</summary>
+        <summary>Technical details</summary>
         <button class="sb modal-copy-btn" onclick="modalCopyJson()">Copy JSON</button>
         <pre class="modal-dev-json" id="modal-dev-json"></pre>
       </details>
@@ -919,10 +924,79 @@ function _titleCase(s){
   return String(s).replace(/_/g,' ').replace(/\b\w/g, c => c.toUpperCase());
 }
 
-// Build visible fact cells for the grid from the event's detail object.
-// Kind-specific rules apply; detection_summary intentionally shows COUNT/TOP
-// only (confidence/track live in Developer details for those events).
-// Max 6 cells. Null/undefined values are skipped.
+// Backend kind → human-readable label. Translation lives client-side
+// because the backend stays kind-agnostic; format_event_for_ui only
+// builds display_summary, not the operator-facing event-type word.
+const KIND_HUMAN = {
+  detection:         'Person detection',
+  detection_summary: 'Activity summary',
+  behavior:          'Behavior',
+  face_match:        'Face match',
+  audio:             'Audio event',
+  thermal:           'Thermal anomaly',
+  anomaly:           'Visual anomaly',
+  burst_summary:     'Multiple events',
+};
+
+// Format an event ts (seconds since epoch) for the modal facts list.
+// Longer than fmtTs so the modal reads as prose, e.g. "27 Apr 2026, 14:12:36".
+function fmtTsHuman(ts){
+  const d = new Date(Number(ts) * 1000);
+  if(isNaN(d.getTime())) return '—';
+  try {
+    return d.toLocaleDateString('en-GB',
+      {year:'numeric', month:'short', day:'numeric'}) +
+      ', ' +
+      d.toLocaleTimeString('en-GB', {hour12:false});
+  } catch(_) {
+    return fmtTs(ts);
+  }
+}
+
+// Translate kind → human label, refining with subtype when present.
+function kindHuman(ev){
+  const det = ev.detail || {};
+  const base = KIND_HUMAN[ev.kind] || _titleCase(ev.kind || 'event');
+  if(ev.kind === 'behavior' && det.action){
+    return `${base} — ${String(det.action)}`;
+  }
+  if(ev.kind === 'audio' && det.class){
+    return `${base} — ${String(det.class)}`;
+  }
+  return base;
+}
+
+// Build operator-friendly facts list for the modal.
+// Pure: returns [{label, value}] in display order. Severity intentionally
+// omitted — the badge above already shows it, and a duplicate row would
+// expose the existing severityOf() upgrade vs detail.severity disagreement.
+// Confidence / Track / Zone show conditionally; Zone hides "main" since
+// it's a placeholder until polygons land.
+function buildHumanFacts(ev){
+  const det = ev.detail || {};
+  const facts = [];
+  facts.push({label:'Camera', value: ev.display_camera || ev.camera || '—'});
+  facts.push({label:'Time',   value: fmtTsHuman(ev.ts)});
+  facts.push({label:'Type',   value: kindHuman(ev)});
+  if(det.confidence != null && !isNaN(Number(det.confidence))){
+    facts.push({label:'Confidence',
+                value: Math.round(Number(det.confidence) * 100) + '%'});
+  }
+  if(det.track_id != null){
+    const tid = Number(det.track_id);
+    if(Number.isInteger(tid) && tid >= 0){
+      facts.push({label:'Track', value:'#' + tid});
+    }
+  }
+  if(det.zone && String(det.zone) !== 'main'){
+    facts.push({label:'Zone', value:String(det.zone)});
+  }
+  return facts;
+}
+
+// Build fact cells for the home-grid card layout. The event modal uses
+// buildHumanFacts instead — operator-friendly labels, no kind-specific
+// quirks. Max 6 cells; null/undefined values skipped.
 function buildFacts(ev){
   const det = ev.detail || {};
   const kind = ev.kind || '';
@@ -993,13 +1067,11 @@ function openModal(evStr){
   const sev = severityOf(obj);
   const meta = SEVERITY_META[sev] || SEVERITY_META.info;
 
-  const facts = buildFacts(obj);
-  const factsHtml = facts.length
-    ? facts.map(f =>
-        `<div class="mfact"><div class="mfact-l">${_htmlEsc(f.label)}</div>` +
-        `<div class="mfact-v" title="${_htmlEsc(f.value)}">${_htmlEsc(f.value)}</div></div>`
-      ).join('')
-    : '<div class="mfact-empty">No structured facts — see developer details below.</div>';
+  const humanFacts = buildHumanFacts(obj);
+  const humanHtml = humanFacts.map(f =>
+    `<dt>${_htmlEsc(f.label)}</dt>` +
+    `<dd title="${_htmlEsc(f.value)}">${_htmlEsc(f.value)}</dd>`
+  ).join('');
 
   const cam = obj.display_camera || obj.camera || '—';
   const timeTxt = obj.display_time || fmtTs(obj.ts);
@@ -1016,7 +1088,7 @@ function openModal(evStr){
   document.getElementById('modal-headline').textContent = headline;
   document.getElementById('modal-sub').textContent =
     'Camera ' + cam + '   ·   ' + timeTxt;
-  document.getElementById('modal-facts').innerHTML = factsHtml;
+  document.getElementById('modal-human').innerHTML = humanHtml;
   document.getElementById('modal-dev-json').textContent = JSON.stringify(obj, null, 2);
 
   // Snapshot evidence — show the JPEG if the server has one, else the
