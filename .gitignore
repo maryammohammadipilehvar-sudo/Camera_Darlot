@@ -23,3 +23,14 @@ _old_backups/
 *credential*
 *secret*
 .config/
+
+# Test corpus — operator-recorded MP4s, large, machine-specific.
+# Schema (filenames + scenarios) lives in tests/corpus/README.md.
+tests/corpus/*.mp4
+tests/corpus/*.avi
+tests/corpus/*.mkv
+tests/corpus/*.webm
+
+# Pytest
+.pytest_cache/
+.coverage

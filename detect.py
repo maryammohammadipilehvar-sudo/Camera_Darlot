@@ -573,6 +573,17 @@ def start_thermal_monitor(cfg: dict):
     log.info("Thermal monitor started")
 
 
+# ─────────────────────────── REPLAY MODE STATE (Session 8) ────────────────────
+# When detect.py is invoked with --replay PATH, the pipeline reads from the
+# given MP4 instead of RTSP, skips every network-bound side effect (MQTT
+# broker, MJPEG server, /health server, snapshot writer, Telegram notifier),
+# and captures every emit_alert decision into _replay_capture for later
+# JSON dump. Tests subprocess-launch detect.py with these flags and assert
+# against the JSON output. See tests/test_replay.py.
+
+_replay_capture: "Optional[list]" = None  # accumulator; None means not in replay
+
+
 # ─────────────────────────── MODE RESOLUTION (Session 5) ──────────────────────
 # OCCUPIED / CLOSED / MAINTENANCE — resolved at decision time from CFG schedule
 # and the system clock. Pure: never reads global state, never caches.
@@ -641,6 +652,12 @@ def resolve_mode(cfg: dict, now: Optional[datetime] = None) -> str:
     Returns:
         One of OCCUPIED, CLOSED, MAINTENANCE.
     """
+    # Replay/test override — bypasses schedule + maintenance flag so tests
+    # are deterministic regardless of when they run.
+    forced = cfg.get("replay_force_mode")
+    if forced in _VALID_MODES:
+        return forced
+
     sched = cfg["schedule"]
     if sched.get("maintenance", False):
         return "MAINTENANCE"
@@ -966,6 +983,10 @@ def _audit_write(
 ) -> None:
     """Insert one decision row. Never raises.
 
+    Also feeds the replay capture buffer when --replay is active, so test
+    harnesses can assert against the JSON dump without needing to read the
+    audit DB.
+
     Args:
         event_id: events.id when the decision wrote one; None for suppressed.
         camera_id: camera identifier.
@@ -976,6 +997,19 @@ def _audit_write(
         reason_detail: optional free-form context (e.g., "count=5 window=30s").
         zone: zone name; "main" until zone polygons land.
     """
+    ts = int(time.time())
+    if _replay_capture is not None:
+        _replay_capture.append({
+            "ts": ts,
+            "event_id": event_id,
+            "camera_id": camera_id,
+            "kind": kind,
+            "computed_severity": computed_severity,
+            "mode": mode,
+            "decision": decision,
+            "reason_detail": reason_detail,
+            "zone": zone,
+        })
     if _audit_conn is None:
         # _audit_init wasn't called; surface loudly but don't raise.
         log.error(
@@ -990,7 +1024,7 @@ def _audit_write(
                 "(ts, event_id, camera_id, kind, computed_severity, "
                 " mode, decision, reason_detail, zone) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (int(time.time()), event_id, camera_id, kind,
+                (ts, event_id, camera_id, kind,
                  computed_severity, mode, decision, reason_detail, zone),
             )
             _audit_conn.commit()
@@ -2005,14 +2039,27 @@ def run(cfg: dict):
         sys.exit(1)
     log.info("Mode at startup: %s", resolve_mode(cfg))
 
+    # Replay mode (offline test harness) skips every network-bound side
+    # effect. Inference + decision pipeline still run; everything that
+    # would touch operators or external systems is gated off.
+    replay = bool(cfg.get("replay_mode"))
+    if replay:
+        cfg["snapshot_enabled"] = False
+        cfg["notifier_enabled"] = False
+        log.info(
+            "REPLAY mode active — MQTT / MJPEG / health / snapshots / "
+            "Telegram disabled. Source: %s", cfg.get("rtsp_url"),
+        )
+
     # ── Start support services ─────────────────────────────────────────────────
-    threading.Thread(target=_mqtt_worker, args=(cfg,), daemon=True, name="mqtt").start()
-    start_mjpeg(cfg["mjpeg_port"])
-    start_health(cfg["health_port"])
-    start_thermal_monitor(cfg)
-    _setup_snapshot_dir(cfg)
-    start_snapshot_writer(cfg)
-    start_notify_worker(cfg)
+    if not replay:
+        threading.Thread(target=_mqtt_worker, args=(cfg,), daemon=True, name="mqtt").start()
+        start_mjpeg(cfg["mjpeg_port"])
+        start_health(cfg["health_port"])
+        start_thermal_monitor(cfg)
+        _setup_snapshot_dir(cfg)
+        start_snapshot_writer(cfg)
+        start_notify_worker(cfg)
 
     # ── Load models ────────────────────────────────────────────────────────────
     yolo      = load_yolo(cfg["yolo_engine"])
@@ -2048,7 +2095,8 @@ def run(cfg: dict):
     running        = True
     n_frame        = 0
     last_infer     = 0.0
-    infer_gap      = 1.0 / max(cfg["inference_fps"], 1.0)
+    # Replay mode runs flat-out — every frame in the MP4 should be processed.
+    infer_gap      = 0.0 if replay else 1.0 / max(cfg["inference_fps"], 1.0)
     last_tracks    = np.empty((0, 6))
     last_faces:    list = []
     last_labels:   list = []
@@ -2073,12 +2121,18 @@ def run(cfg: dict):
 
     try:
         while running:
-            # Drop stale frames for low latency
-            for _ in range(3):
-                cam.grab()
+            # Drop stale frames for low latency on the live RTSP path.
+            # Replay mode reads every frame of the MP4 — no dropping.
+            if not replay:
+                for _ in range(3):
+                    cam.grab()
 
             ret, raw = cam.read()
             if not ret or raw is None:
+                if replay:
+                    log.info("REPLAY: end of clip — exiting")
+                    running = False
+                    continue
                 if str(cfg["rtsp_url"]).endswith((".mp4",".webm",".avi",".mkv")):
                     log.info("End of file → looping")
                     cam.release()
@@ -2300,10 +2354,65 @@ def run(cfg: dict):
             f"Pipeline stopped — frames={n_frame} alerts={_health['alerts_total']}"
             f" uptime={_health['uptime_s']}s"
         )
+        # Dump replay capture if requested.
+        out_path = cfg.get("replay_emit_json")
+        if _replay_capture is not None and out_path:
+            try:
+                Path(out_path).write_text(json.dumps(_replay_capture, indent=2))
+                log.info(
+                    "REPLAY: wrote %d decision(s) to %s",
+                    len(_replay_capture), out_path,
+                )
+            except Exception as e:
+                log.error("REPLAY: failed to write %s: %s", out_path, e)
 
 
-def main():
+def main() -> None:
+    """CLI entry point.
+
+    Default invocation runs the production pipeline against the configured
+    RTSP source. ``--replay`` switches to offline test mode: source is an
+    MP4 path, every network-bound side effect is gated off, and every
+    decision the pipeline would make is captured to JSON for assertion in
+    pytest.
+    """
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Sentinel security pipeline (production + replay).",
+    )
+    parser.add_argument(
+        "--replay", metavar="PATH",
+        help="Path to an MP4/AVI/etc. — runs offline against this file "
+             "instead of RTSP. Disables MQTT, MJPEG, /health, snapshots, "
+             "and Telegram. Exits cleanly on EOF.",
+    )
+    parser.add_argument(
+        "--emit-json", dest="emit_json", metavar="PATH",
+        help="Replay only: write every emitted decision (kind, severity, "
+             "mode, decision, ...) to this JSON file on exit.",
+    )
+    parser.add_argument(
+        "--mode", choices=list(_VALID_MODES),
+        help="Force resolve_mode to return this value, bypassing the "
+             "schedule. Useful for replay tests that need deterministic "
+             "mode regardless of when they run.",
+    )
+    args = parser.parse_args()
+
+    if args.replay:
+        global _replay_capture
+        _replay_capture = []
+        CFG["rtsp_url"] = args.replay
+        CFG["replay_mode"] = True
+        CFG["replay_emit_json"] = args.emit_json
+    elif args.emit_json:
+        parser.error("--emit-json requires --replay")
+
+    if args.mode:
+        CFG["replay_force_mode"] = args.mode
+
     run(CFG)
+
 
 if __name__ == "__main__":
     main()
