@@ -167,6 +167,12 @@ CFG = {
         "behavior:fallen":    {"OCCUPIED": "LOW",      "CLOSED": "MEDIUM",   "MAINTENANCE": "LOW"},
         "behavior:fighting":  {"OCCUPIED": "LOW",      "CLOSED": "MEDIUM",   "MAINTENANCE": "LOW"},
         "behavior:running":   {"OCCUPIED": "LOW",      "CLOSED": "LOW",      "MAINTENANCE": "LOW"},
+        # Operator-defined forbidden zones — person inside any saved
+        # polygon. Operator brief: CRITICAL all modes.
+        "forbidden_zone":     {"OCCUPIED": "CRITICAL", "CLOSED": "CRITICAL", "MAINTENANCE": "CRITICAL"},
+        # Phone-use detected via YOLO cell-phone class (67) overlapping a
+        # person track. Operator brief: LOW × OCCUPIED, MEDIUM × CLOSED.
+        "phone_use":          {"OCCUPIED": "LOW",      "CLOSED": "MEDIUM",   "MAINTENANCE": "LOW"},
     },
 
     # ── Notification thresholds (Session 5) ───────────────────────
@@ -180,6 +186,21 @@ CFG = {
         "INFO":     {"OCCUPIED": "suppressed", "CLOSED": "dashboard",  "MAINTENANCE": "suppressed"},
     },
 
+    # ── Operator gate: only forbidden_zone events surface ────────
+    # When True, every alert kind EXCEPT forbidden_zone is silenced —
+    # no events row, no Telegram, no dashboard. Audit log still
+    # records the decision so operators can later answer "what would
+    # have fired if we relaxed the rule?". Flip to False to restore
+    # the full severity-table-driven pipeline.
+    "alerts_only_forbidden_zone": True,
+
+    # ── Phone-use detection ────────────────────────────────────────
+    # IoU threshold for matching a YOLO cell-phone bbox against a
+    # person bbox. Loose — phone-on-desk near a sitting person counts
+    # as phone use per operator brief. Adjust if false-positive rate
+    # is unacceptable in real traffic.
+    "phone_use_iou":  0.05,
+
     # ── Three-layer dedup windows (Session 5, Telegram-bound only) ──
     "dedup": {
         "track_window_s":  300,    # 5 min — same (camera, track_id, kind)
@@ -189,7 +210,7 @@ CFG = {
     },
 }
 
-ALLOWED_CLASSES = {0, 2, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23}
+ALLOWED_CLASSES = {0, 2, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 67}  # 67 = cell phone (phone_use)
 
 # ─────────────────────────── LOGGING ──────────────────────────────────────────
 logging.basicConfig(
@@ -1114,8 +1135,21 @@ def _summary_of(kind: str, detail: dict) -> str:
     if k == "detection_summary":
         return str(detail.get("label") or "Detection summary")
     if k == "detection":
-        class_name = str(detail.get("class_name") or "object").replace("_", " ")
-        return f"1 {class_name.lower()} detected"
+        class_name = str(detail.get("class_name") or "object").replace("_", " ").lower()
+        # Operator brief: include action when behavior classifier has one.
+        # Suppress the routine defaults so "1 person — standing" doesn't add noise.
+        action = str(detail.get("action") or "").lower()
+        if action and action not in ("unknown", "standing", ""):
+            return f"1 {class_name} — {action}"
+        return f"1 {class_name} detected"
+    if k == "forbidden_zone":
+        zone = detail.get("zone") or detail.get("zone_name") or "zone"
+        return f"Person in forbidden zone: {zone}"
+    if k == "phone_use":
+        tid = detail.get("track_id")
+        if isinstance(tid, int) and tid >= 0:
+            return f"Phone use detected — Person #{tid}"
+        return "Phone use detected"
     if k == "loitering":
         zone = detail.get("zone", "unknown")
         return f"Loitering detected in {zone}"
@@ -1339,6 +1373,23 @@ def emit_alert(camera_id: str, kind: str, detail: dict) -> None:
 
     severity = compute_severity(kind, detail, mode, CFG, zone=zone)
     decision_route = compute_decision(severity, mode, CFG)
+
+    # Operator gate: only forbidden_zone events surface to operators.
+    # Everything else gets an audit row (forensics — operator can query
+    # "what would have fired if we relaxed this?") then short-circuits
+    # before events row / Telegram / dashboard. Flip CFG flag to disable.
+    if (
+        CFG.get("alerts_only_forbidden_zone", False)
+        and kind != "forbidden_zone"
+    ):
+        _audit_write(
+            event_id=None, camera_id=camera_id, kind=kind,
+            computed_severity=severity, mode=mode,
+            decision="suppressed_threshold",
+            reason_detail="alerts_only_forbidden_zone",
+            zone=zone,
+        )
+        return
 
     # Audit-log integrity: if the threshold table chose "telegram" but the
     # notifier is unavailable (module import failed) or disabled at startup,
@@ -1659,6 +1710,130 @@ def start_audio_thread(yamnet: YAMNetAudio, camera_id: str, cfg: dict):
     threading.Thread(target=_run, daemon=True, name="audio").start()
 
 
+# ─────────────────────────── FORBIDDEN-ZONE ENGINE ────────────────────────────
+class ForbiddenZoneEngine:
+    """Operator-drawn forbidden polygons, persisted in SQLite.
+
+    Hot-reloads from the dashboard's writes within ~5 seconds via a
+    cheap (count, max(updated_at)) check. Read-only DB connection so
+    it never blocks the dashboard's writers. Empty zones list = no
+    forbidden-zone alerts (graceful disable).
+
+    Polygons are stored as JSON arrays of [x, y] floats in 0..1
+    (image-content normalized) and converted to inference-frame pixels
+    at load time.
+
+    Thread-safe: ``check`` is called from the main loop while the
+    reload thread mutates ``self._zones``. Both paths take ``self._lock``.
+    """
+
+    def __init__(self, db_path: str, frame_w: int, frame_h: int) -> None:
+        self._db_path = db_path
+        self._frame_w = frame_w
+        self._frame_h = frame_h
+        # zones format after load: [{"id": int, "name": str,
+        #                            "poly": np.ndarray (N,2) int32}]
+        self._zones: list = []
+        self._last_meta: tuple = (-1, -1)  # (count, max_updated_at)
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._conn: "Optional[sqlite3.Connection]" = None
+
+    def _open_ro(self) -> None:
+        try:
+            self._conn = sqlite3.connect(
+                f"file:{self._db_path}?mode=ro", uri=True,
+                check_same_thread=False, timeout=5.0,
+            )
+        except Exception as e:
+            log.error("FORBIDDEN_ZONE: read-only connect failed: %s", e)
+            self._conn = None
+
+    def _meta(self) -> "tuple[int, int]":
+        if self._conn is None:
+            return (0, 0)
+        try:
+            row = self._conn.execute(
+                "SELECT COUNT(*), COALESCE(MAX(updated_at), 0) FROM forbidden_zones"
+            ).fetchone()
+            return (int(row[0]), int(row[1]))
+        except sqlite3.OperationalError:
+            # Table doesn't exist yet (dashboard hasn't created it). Treat as empty.
+            return (0, 0)
+        except Exception as e:
+            log.warning("FORBIDDEN_ZONE: meta query failed: %s", e)
+            return self._last_meta
+
+    def _reload(self) -> None:
+        if self._conn is None:
+            return
+        new: list = []
+        try:
+            for row in self._conn.execute(
+                "SELECT id, name, polygon FROM forbidden_zones ORDER BY id"
+            ):
+                try:
+                    pts = json.loads(row[2])
+                    poly = np.array(
+                        [[round(float(p[0]) * self._frame_w),
+                          round(float(p[1]) * self._frame_h)]
+                         for p in pts],
+                        dtype=np.int32,
+                    )
+                    if len(poly) >= 3:
+                        new.append({"id": int(row[0]), "name": str(row[1]), "poly": poly})
+                except Exception as e:
+                    log.warning(
+                        "FORBIDDEN_ZONE: skipping malformed polygon id=%s: %s",
+                        row[0], e,
+                    )
+        except sqlite3.OperationalError:
+            pass  # table not yet created
+        except Exception as e:
+            log.warning("FORBIDDEN_ZONE: reload failed: %s", e)
+            return
+        with self._lock:
+            self._zones = new
+        log.info("FORBIDDEN_ZONE reloaded: %d zone(s)", len(new))
+
+    def start_reload_thread(self, interval_s: float = 5.0) -> None:
+        self._open_ro()
+        # Initial load before the loop so the engine is ready immediately.
+        self._last_meta = self._meta()
+        if self._last_meta != (0, 0):
+            self._reload()
+
+        def _loop() -> None:
+            while not self._stop.is_set():
+                try:
+                    m = self._meta()
+                    if m != self._last_meta:
+                        self._last_meta = m
+                        self._reload()
+                except Exception:
+                    log.exception("FORBIDDEN_ZONE reload thread error — continuing")
+                self._stop.wait(interval_s)
+
+        threading.Thread(
+            target=_loop, daemon=True, name="forbidden-zone-reload",
+        ).start()
+        log.info("FORBIDDEN_ZONE reload thread started (interval=%.1fs)", interval_s)
+
+    def check(self, cx: int, cy: int) -> "Optional[dict]":
+        """Return matching zone dict if (cx,cy) is inside any forbidden polygon."""
+        with self._lock:
+            zones = list(self._zones)  # snapshot for the loop
+        for z in zones:
+            if cv2.pointPolygonTest(z["poly"], (cx, cy), False) >= 0:
+                return z
+        return None
+
+    def all_polys(self) -> list:
+        """Return shallow copy of zones for the live-feed overlay."""
+        with self._lock:
+            return list(self._zones)
+
+
 # ─────────────────────────── ZONE ENGINE ──────────────────────────────────────
 class ZoneEngine:
     def __init__(self, zones: list):
@@ -1771,6 +1946,33 @@ def draw_faces(frame, faces, labels):
         cv2.putText(frame, label, (x1, y1-6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255,200,0), 1, cv2.LINE_AA)
 
+def draw_forbidden_zones(frame, zones: list) -> None:
+    """Outline every persisted forbidden polygon in red on the live feed.
+
+    Visual confirmation that the rule is active. Drawn before draw_tracks
+    so person bboxes overlay it.
+    """
+    if not zones:
+        return
+    for z in zones:
+        poly = z["poly"]
+        # Translucent red fill + solid red border.
+        overlay = frame.copy()
+        cv2.fillPoly(overlay, [poly], (40, 40, 220))
+        cv2.addWeighted(overlay, 0.18, frame, 0.82, 0, dst=frame)
+        cv2.polylines(frame, [poly], isClosed=True,
+                      color=(40, 40, 220), thickness=2, lineType=cv2.LINE_AA)
+        # Label centered on the polygon centroid.
+        m = cv2.moments(poly)
+        if m["m00"]:
+            cx = int(m["m10"] / m["m00"]); cy = int(m["m01"] / m["m00"])
+            txt = str(z.get("name") or "")
+            if txt:
+                cv2.putText(frame, txt, (cx - 30, cy),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                            (255, 255, 255), 1, cv2.LINE_AA)
+
+
 def draw_anomaly(frame, score: float):
     if score > CFG["anomaly_thresh"]:
         cv2.putText(frame, f"ANOMALY {score:.2f}", (10,30),
@@ -1830,6 +2032,13 @@ def run(cfg: dict):
     patchcore = None
     yamnet    = None
     zones     = ZoneEngine(cfg["zones"])
+    # Operator-drawn forbidden polygons — DB-backed, hot-reloaded every 5s.
+    forbidden = ForbiddenZoneEngine(
+        _audit_db_path(),
+        frame_w=cfg["resize_w"],
+        frame_h=cfg["resize_h"],
+    )
+    forbidden.start_reload_thread(interval_s=5.0)
 
     cam = open_camera(cfg["rtsp_url"])
 
@@ -1949,6 +2158,25 @@ def run(cfg: dict):
                 # the central decision pipeline (compute_decision + three-layer
                 # filter inside emit_alert). Every track emits; the orchestrator
                 # decides what's noise.
+                #
+                # Action cache (Session 7): read the latest behavior labels
+                # ONCE per frame and stamp the action onto each detection so
+                # _summary_of can render "1 person — sitting" etc.
+                action_by_track = (
+                    beh_analyzer.get_labels() if beh_analyzer else {}
+                )
+
+                # First pass: collect phone bboxes for the phone-use IoU check.
+                phone_bboxes: list = []
+                for t in last_tracks:
+                    cls_t = int(t[6]) if (tracker is not None and len(t) > 6) else (
+                        int(t[5]) if len(t) > 5 else -1
+                    )
+                    if cls_t == 67:  # cell phone
+                        phone_bboxes.append([int(t[0]), int(t[1]), int(t[2]), int(t[3])])
+
+                phone_iou = float(cfg.get("phone_use_iou", 0.05))
+
                 for t in last_tracks:
                     x1, y1, x2, y2 = int(t[0]), int(t[1]), int(t[2]), int(t[3])
                     bbox = [x1, y1, x2, y2]
@@ -1970,11 +2198,57 @@ def run(cfg: dict):
                         continue
                     class_name = COCO_NAMES[cls]
 
+                    # Cell-phone detections feed phone_use only — no
+                    # standalone "1 cell phone detected" events.
+                    if cls == 67:
+                        continue
+
+                    # ── Forbidden-zone check (person tracks only) ─────────
+                    # Fires per-frame while person is in zone; track-dedup
+                    # (5min window) collapses to one fired audit row. By design
+                    # — see Section 8 audit traceability.
+                    if cls == 0 and forbidden is not None:
+                        fz = forbidden.check(cx, cy)
+                        if fz is not None:
+                            emit_alert(cfg["camera_id"], "forbidden_zone", {
+                                "track_id":  track_id if track_id >= 0 else None,
+                                "zone":      fz["name"],
+                                "zone_id":   fz["id"],
+                                "bbox":      bbox,
+                                "label":     f"Person in forbidden zone: {fz['name']}",
+                            })
+
+                    # ── Phone-use check (person tracks only) ──────────────
+                    # Fires per-frame while phone overlaps person; track-dedup
+                    # (5min window) collapses to one fired audit row. Same
+                    # pattern as detection events. Audit log will show
+                    # suppressed_dedup_track rows by design (Section 8
+                    # traceability).
+                    if cls == 0 and phone_bboxes:
+                        for ph in phone_bboxes:
+                            if iou_xyxy(bbox, ph) > phone_iou:
+                                emit_alert(cfg["camera_id"], "phone_use", {
+                                    "track_id":  track_id if track_id >= 0 else None,
+                                    "bbox":      bbox,
+                                    "phone_bbox": ph,
+                                    "label":     "Phone use detected",
+                                })
+                                break
+
+                    # Action cache stamp — pure read, no mutation. Stale by
+                    # a few hundred ms is fine; analyzer prunes on its own.
+                    action_label = None
+                    if track_id >= 0:
+                        info = action_by_track.get(track_id)
+                        if info:
+                            action_label = info.get("action")
+
                     emit_alert(cfg["camera_id"], "detection", {
                         "class_name": class_name,
                         "confidence": round(conf, 3),
                         "bbox":       bbox,
                         "track_id":   track_id if track_id >= 0 else None,
+                        "action":     action_label,
                         "label":      f"{class_name} detected",
                         "severity":   "medium" if class_name == "person" else "low",
                     })
@@ -1988,6 +2262,7 @@ def run(cfg: dict):
             # ── ANNOTATE + STREAM ──────────────────────────────────────────────
             vis = frame.copy()
             beh_labels = beh_analyzer.get_labels() if beh_analyzer else {}
+            draw_forbidden_zones(vis, forbidden.all_polys())
             draw_tracks(vis, last_tracks)
             if beh_analyzer:
                 try:

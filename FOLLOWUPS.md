@@ -4,6 +4,73 @@ Deferred work captured from audits and verification runs. Items here are
 intentionally not blocking the current change; each entry notes urgency and
 sufficient context to pick up in a future session.
 
+### alerts_only_forbidden_zone gate suppresses everything else (MEDIUM — review when re-tuning rules)
+
+`CFG.alerts_only_forbidden_zone = True` (Session 7) silences every
+event kind except `forbidden_zone`. Phone-use, action-captioned
+detections, behavior alerts, thermal warnings, audio events,
+detection summaries — all build audit rows but never reach the
+events table, dashboard, or Telegram.
+
+This was the operator's explicit ship-it call after the v2 rules
+session. Audit log still captures the decisions
+(`decision='suppressed_threshold'`,
+`reason_detail='alerts_only_forbidden_zone'`) so operators can
+later query "what would have fired?" and unfreeze on a per-kind
+basis.
+
+To relax: flip the CFG flag to `False`. Severity table + threshold
+table take over again — every kind routed per Session 5 rules.
+Pair the flip with a fresh foreground test, the previous-tuning
+session's results don't transfer once the gate moves.
+
+Review trigger: any operator request that surfaces non-forbidden-
+zone information (e.g., "I want a daily report of detection
+counts" or "we need phone-use back").
+
+### phone_use IoU threshold tuning (LOW)
+
+`CFG.phone_use_iou = 0.05` is loose for production. Phone-on-desk
+near a sitting person triggers without the phone being held. Tune
+to 0.15–0.30 after observing real warehouse traffic.
+
+May also need pose-based "phone in hand" refinement (wrist keypoint
+near phone bbox center) to distinguish phone-on-desk from
+phone-being-used. Adds dependency on YOLOv8n-pose keypoint flow
+into a new classifier; only worth it if IoU tuning alone isn't
+enough.
+
+### forbidden_zones lacks camera_id column (MEDIUM)
+
+Today fine — single-camera deployment. When multi-camera support
+lands, schema migration needed:
+
+```sql
+ALTER TABLE forbidden_zones ADD COLUMN camera_id TEXT NOT NULL DEFAULT 'cam_01';
+```
+
+Then update:
+- API endpoints to filter by `?camera=` and require it on POST
+- Dashboard drawing UI to scope polygons to the selected camera tile
+- `ForbiddenZoneEngine.check(cx, cy, camera_id)` signature change
+- Engine reload thread to load only its own camera's zones
+
+Block on the multi-site architecture entry (separate FOLLOWUP) so
+both schema changes ship together.
+
+### Forbidden-zone drawing UI is mouse-only (LOW)
+
+Canvas listeners are click / mousemove / dblclick only. Touch
+events (touchstart / touchmove / touchend) not wired. Operators
+on iPads or touch-enabled monitors can't draw polygons; the
+"Draw zone" button works but tapping the canvas does nothing.
+
+Add when there's a real iPad operator request — desktop-only is
+acceptable for warehouse deployment today. Implementation is
+straightforward (~30 lines): map the touch event coordinate
+through the same `_zoneEvtToNorm` helper, with `touches[0]` as
+the position source, and a synthetic dblclick on rapid-tap.
+
 ### Behavior pipeline duplicates the central dedup (LOW)
 
 `behavior.py:should_alert` runs a per-track, per-action cooldown

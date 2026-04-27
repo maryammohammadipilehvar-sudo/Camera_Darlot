@@ -27,8 +27,9 @@ from typing import Optional
 
 import paho.mqtt.client as mqtt
 import uvicorn
-from fastapi import FastAPI, Query, Response, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from pydantic import BaseModel, Field
 
 # ── Config ────────────────────────────────────────────────────────────────────
 MQTT_HOST   = os.getenv("MQTT_HOST",   "localhost")
@@ -76,6 +77,14 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_ts   ON events(ts);
             CREATE INDEX IF NOT EXISTS idx_kind ON events(kind);
             CREATE INDEX IF NOT EXISTS idx_cam  ON events(camera);
+            CREATE TABLE IF NOT EXISTS forbidden_zones (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                name       TEXT    NOT NULL,
+                polygon    TEXT    NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_fz_updated ON forbidden_zones(updated_at);
         """)
         c.commit()
         c.close()
@@ -422,6 +431,92 @@ def api_events(
         "limit": limit,
         "offset": offset
     }
+
+# ── Forbidden zones (operator-drawn polygons) ─────────────────────────────────
+
+class ZoneCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120)
+    polygon: list  # validated below — list of [x,y] pairs in 0..1
+
+
+def _validate_polygon(polygon) -> str:
+    """Return JSON string for storage if valid; raise HTTPException otherwise."""
+    if not isinstance(polygon, list) or len(polygon) < 3:
+        raise HTTPException(status_code=400, detail="polygon must have >= 3 points")
+    cleaned = []
+    for p in polygon:
+        if not (isinstance(p, (list, tuple)) and len(p) == 2):
+            raise HTTPException(status_code=400, detail="each point must be [x,y]")
+        try:
+            x, y = float(p[0]), float(p[1])
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="point coords must be numeric")
+        if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+            raise HTTPException(status_code=400, detail="coords must be in 0..1")
+        cleaned.append([x, y])
+    return json.dumps(cleaned)
+
+
+def _row_to_zone(row) -> dict:
+    return {
+        "id":         row["id"],
+        "name":       row["name"],
+        "polygon":    json.loads(row["polygon"]),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+@app.get("/api/zones")
+def api_zones_list():
+    with _db_lock:
+        c = _conn()
+        rows = c.execute(
+            "SELECT id, name, polygon, created_at, updated_at "
+            "FROM forbidden_zones ORDER BY id"
+        ).fetchall()
+        c.close()
+    return {"zones": [_row_to_zone(r) for r in rows]}
+
+
+@app.post("/api/zones", status_code=201)
+def api_zones_create(payload: ZoneCreate):
+    poly_json = _validate_polygon(payload.polygon)
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name must not be empty")
+    now = int(time.time())
+    with _db_lock:
+        c = _conn()
+        cur = c.execute(
+            "INSERT INTO forbidden_zones (name, polygon, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?)",
+            (name, poly_json, now, now),
+        )
+        row_id = cur.lastrowid
+        c.commit()
+        row = c.execute(
+            "SELECT id, name, polygon, created_at, updated_at "
+            "FROM forbidden_zones WHERE id=?", (row_id,),
+        ).fetchone()
+        c.close()
+    log.info(f"forbidden_zone created id={row_id} name={name!r}")
+    return _row_to_zone(row)
+
+
+@app.delete("/api/zones/{zone_id}", status_code=204)
+def api_zones_delete(zone_id: int):
+    with _db_lock:
+        c = _conn()
+        cur = c.execute("DELETE FROM forbidden_zones WHERE id=?", (zone_id,))
+        deleted = cur.rowcount
+        c.commit()
+        c.close()
+    if not deleted:
+        raise HTTPException(status_code=404, detail="zone not found")
+    log.info(f"forbidden_zone deleted id={zone_id}")
+    return Response(status_code=204)
+
 
 @app.get("/api/events/{event_id}/snapshot")
 def api_event_snapshot(event_id: int):
