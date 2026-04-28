@@ -116,7 +116,26 @@ class ActionClassifier:
     No neural network required — runs in <0.5ms per track on CPU.
     """
 
-    def classify(self, window: TrackWindow) -> str:
+    def classify(
+        self,
+        window: TrackWindow,
+        multi_person: bool = False,
+    ) -> str:
+        """Classify the current action for this track.
+
+        Args:
+            window: per-track rolling history of bboxes + keypoints.
+            multi_person: ``True`` when this frame contains 2+ person
+                tracks. Required for ``Action.FIGHTING`` to even be
+                considered — solo wrist movement is never fighting in
+                a real warehouse, but it's a common false positive
+                when someone sits at a desk and reaches for a mug or
+                types. The caller (``BehaviorAnalyzer._worker``) sets
+                this from ``len(person_tracks)``.
+
+        Returns:
+            One of the ``Action.*`` strings.
+        """
         if len(window.bbox_history) < 2:
             return Action.UNKNOWN
 
@@ -193,18 +212,53 @@ class ActionClassifier:
             if arm_raised and speed < 0.08:
                 return Action.RAISING
 
-            # Fighting: large wrist velocity
-            wrist_speeds = []
-            for i in range(1, min(len(kps), 5)):
-                prev = kps[-(i+1)]
-                if prev is not None and prev.shape[0] >= 17:
-                    dlw = np.linalg.norm(kps[-i][KP_L_WRIST][:2] - prev[KP_L_WRIST][:2]) / max(h, 1) \
-                          if kps[-i] is not None else 0
-                    drw = np.linalg.norm(kps[-i][KP_R_WRIST][:2] - prev[KP_R_WRIST][:2]) / max(h, 1) \
-                          if kps[-i] is not None else 0
-                    wrist_speeds.append(max(dlw, drw))
-            if wrist_speeds and max(wrist_speeds) > 0.25:
-                return Action.FIGHTING
+            # Fighting: five gates required to fire — single-person wrist
+            # motion at a desk used to false-fire as fighting (Session 9
+            # operator report). Real fights have ALL of:
+            #   1. ≥2 person tracks present in the frame.
+            #   2. Both wrists tracked with confidence > 0.5 right now
+            #      (low confidence → unreliable wrist position → fake
+            #      "velocity" from frame-to-frame jitter).
+            #   3. BOTH wrists moving fast — typing has one wrist on the
+            #      mouse and one resting; fighting throws both arms.
+            #   4. Body itself moving (bbox center > 0.05). Two people
+            #      sitting calmly at adjacent desks shouldn't fire even
+            #      if their hands are moving.
+            #   5. Wrist speed sustained, not a single noisy frame.
+            cur_kp = kps[-1] if kps else None
+            both_wrists_confident = (
+                multi_person
+                and cur_kp is not None
+                and cur_kp.shape[0] >= 17
+                and float(cur_kp[KP_L_WRIST][2]) > 0.5
+                and float(cur_kp[KP_R_WRIST][2]) > 0.5
+            )
+            if both_wrists_confident:
+                l_speeds, r_speeds = [], []
+                for i in range(1, min(len(kps), 5)):
+                    prev = kps[-(i + 1)]
+                    cur  = kps[-i]
+                    if (prev is None or cur is None
+                            or prev.shape[0] < 17 or cur.shape[0] < 17):
+                        continue
+                    if (float(prev[KP_L_WRIST][2]) < 0.4
+                            or float(prev[KP_R_WRIST][2]) < 0.4
+                            or float(cur[KP_L_WRIST][2]) < 0.4
+                            or float(cur[KP_R_WRIST][2]) < 0.4):
+                        continue
+                    dl = np.linalg.norm(
+                        cur[KP_L_WRIST][:2] - prev[KP_L_WRIST][:2]
+                    ) / max(h, 1)
+                    dr = np.linalg.norm(
+                        cur[KP_R_WRIST][:2] - prev[KP_R_WRIST][:2]
+                    ) / max(h, 1)
+                    l_speeds.append(float(dl))
+                    r_speeds.append(float(dr))
+                if (l_speeds and r_speeds
+                        and max(l_speeds) > 0.35
+                        and max(r_speeds) > 0.35
+                        and speed > 0.05):
+                    return Action.FIGHTING
 
         # ── 5. Speed thresholds ────────────────────────────────────────────────
         if speed > 0.20:
@@ -344,6 +398,11 @@ class BehaviorAnalyzer:
             # Match pose results to ByteTrack tracks by IoU
             pose_by_track = self._match_pose_to_tracks(person_tracks, pose_results, frame.shape)
 
+            # Multi-person flag for the classifier — fighting is gated on
+            # ≥2 person tracks present (single person waving hands at a
+            # desk is not fighting; this used to be a major false positive).
+            multi_person = len(person_tracks) >= 2
+
             new_labels: Dict[int, dict] = {}
 
             for t in person_tracks:
@@ -358,7 +417,7 @@ class BehaviorAnalyzer:
                 kps = pose_by_track.get(track_id)
                 w.push(kps, (x1,y1,x2,y2))
 
-                action      = self._classifier.classify(w)
+                action      = self._classifier.classify(w, multi_person=multi_person)
                 next_action = predict_next(action)
                 w.action      = action
                 w.next_action = next_action
