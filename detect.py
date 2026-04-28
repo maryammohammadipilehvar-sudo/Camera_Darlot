@@ -57,6 +57,7 @@ import torch
 from rules import RuleContext, RulesEngine, TrackedObject
 from rules.forbidden_zone import ForbiddenZoneRule
 from rules.loitering import LoiteringRule
+from rules.predicted_intrusion import PredictedIntrusionRule
 
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 
@@ -178,6 +179,14 @@ CFG = {
         # Operator-defined forbidden zones — person inside any saved
         # polygon. Operator brief: CRITICAL all modes.
         "forbidden_zone":     {"OCCUPIED": "CRITICAL", "CLOSED": "CRITICAL", "MAINTENANCE": "CRITICAL"},
+        # Predicted intrusion — extrapolated trajectory enters a forbidden
+        # zone before the person physically does. Designed as an
+        # *early warning*: HIGH during business hours (telegram, but
+        # one rung below the actual breach), CRITICAL after-hours
+        # (treat as imminent threat). Suppressed during MAINTENANCE
+        # because trajectory data is unreliable when staff is moving
+        # through zones for legitimate work.
+        "predicted_intrusion": {"OCCUPIED": "HIGH",     "CLOSED": "CRITICAL", "MAINTENANCE": "INFO"},
         # Phone-use detected via YOLO cell-phone class (67) overlapping a
         # person bbox. Bumped MEDIUM → HIGH in Session 9 follow-up — at
         # MEDIUM the 180-second track-window dedup made the alerts feel
@@ -214,7 +223,7 @@ CFG = {
     # backward compat — translates to ["forbidden_zone"] at startup
     # with a one-time deprecation log line. Mixing both raises at
     # import time so misconfigurations are loud, not subtle.
-    "alert_kind_allowlist": ["forbidden_zone", "phone_use"],
+    "alert_kind_allowlist": ["forbidden_zone", "phone_use", "predicted_intrusion"],
 
     # ── Phone-use detection ────────────────────────────────────────
     # phone_use_containment is the PRODUCTION metric: fraction of the
@@ -224,6 +233,22 @@ CFG = {
     # geometrically tiny next to a person (~1% of area) — IoU caps at
     # ~0.01 even with full containment.
     #
+    # ── Predicted-intrusion (Phase 2) ──────────────────────────────
+    # Velocity-extrapolated trajectory crossing into a forbidden zone
+    # before the person physically does. predict_horizon_s is how far
+    # ahead we project; predict_min_frames is how much history we need
+    # before we trust the velocity estimate; predict_min_velocity_px_s
+    # gates the rule on actual movement (stationary people don't
+    # generate predictions). predict_breach_consecutive demands N
+    # straight frames of predicted breach before firing — kills the
+    # one-frame-noise false alerts. predict_track_ttl_s is when stale
+    # track history is purged from the rule's local dict.
+    "predict_horizon_s":             2.5,
+    "predict_min_frames":            5,
+    "predict_min_velocity_px_s":     30.0,
+    "predict_breach_consecutive":    3,
+    "predict_track_ttl_s":           3.0,
+
     # Default 0.3 = "at least 30% of the phone overlaps the (padded)
     # person bbox." Loose enough to handle bbox jitter when the phone
     # is held at chest level; tighten toward 0.5+ if real warehouse
@@ -2422,11 +2447,15 @@ def run(cfg: dict):
     )
     forbidden.start_reload_thread(interval_s=5.0)
 
-    # ── Rules engine (Phase 1) ─────────────────────────────────────────────────
-    # Adds rules one phase at a time. Today: forbidden_zone, loitering.
-    # phone_use, detection, ppe land in subsequent phases.
+    # ── Rules engine (Phase 1 + 2) ─────────────────────────────────────────────
+    # Phase 1: forbidden_zone, loitering.
+    # Phase 2: predicted_intrusion (trajectory extrapolation onto the
+    #          same forbidden polygons; fires as an early warning before
+    #          the person actually crosses the boundary).
+    # Future phases: ppe_violation, port phone_use + detection emits.
     rules_engine = RulesEngine([
         ForbiddenZoneRule(forbidden),
+        PredictedIntrusionRule(forbidden),
         LoiteringRule(zones),
     ])
     log.info(
