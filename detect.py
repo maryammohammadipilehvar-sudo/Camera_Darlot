@@ -175,8 +175,12 @@ CFG = {
         # polygon. Operator brief: CRITICAL all modes.
         "forbidden_zone":     {"OCCUPIED": "CRITICAL", "CLOSED": "CRITICAL", "MAINTENANCE": "CRITICAL"},
         # Phone-use detected via YOLO cell-phone class (67) overlapping a
-        # person track. Operator brief: LOW × OCCUPIED, MEDIUM × CLOSED.
-        "phone_use":          {"OCCUPIED": "LOW",      "CLOSED": "MEDIUM",   "MAINTENANCE": "LOW"},
+        # person track. Bumped to MEDIUM × OCCUPIED in Session 9 so the
+        # operator gets a Telegram push during business hours; CLOSED stays
+        # MEDIUM (telegram); MAINTENANCE stays LOW (suppressed). Pair with
+        # the tighter phone_use_iou below — 0.05 fires on phone-on-desk
+        # near a sitting person, which is too noisy for Telegram.
+        "phone_use":          {"OCCUPIED": "MEDIUM",   "CLOSED": "MEDIUM",   "MAINTENANCE": "LOW"},
     },
 
     # ── Notification thresholds (Session 5) ───────────────────────
@@ -204,14 +208,15 @@ CFG = {
     # backward compat — translates to ["forbidden_zone"] at startup
     # with a one-time deprecation log line. Mixing both raises at
     # import time so misconfigurations are loud, not subtle.
-    "alert_kind_allowlist": ["forbidden_zone"],
+    "alert_kind_allowlist": ["forbidden_zone", "phone_use"],
 
     # ── Phone-use detection ────────────────────────────────────────
     # IoU threshold for matching a YOLO cell-phone bbox against a
-    # person bbox. Loose — phone-on-desk near a sitting person counts
-    # as phone use per operator brief. Adjust if false-positive rate
-    # is unacceptable in real traffic.
-    "phone_use_iou":  0.05,
+    # person bbox. Tightened from 0.05 → 0.15 in Session 9 to reduce
+    # phone-on-desk false fires now that phone_use routes to Telegram.
+    # FOLLOWUPS suggested 0.15–0.30; start at the conservative end and
+    # tune up if real warehouse traffic still produces false positives.
+    "phone_use_iou":  0.15,
 
     # ── Three-layer dedup windows (Session 5, Telegram-bound only) ──
     "dedup": {
