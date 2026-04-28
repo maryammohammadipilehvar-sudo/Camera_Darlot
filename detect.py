@@ -56,6 +56,7 @@ import torch
 
 from rules import RuleContext, RulesEngine, TrackedObject
 from rules.forbidden_zone import ForbiddenZoneRule
+from rules.loitering import LoiteringRule
 
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 
@@ -2126,6 +2127,14 @@ class ForbiddenZoneEngine:
 
 # ─────────────────────────── ZONE ENGINE ──────────────────────────────────────
 class ZoneEngine:
+    """Per-track dwell timer per polygon — emits loitering when dwell exceeded.
+
+    Refactored in Phase 1c: ``observe`` is a generator yielding event
+    detail dicts instead of calling ``emit_alert`` directly. The rule
+    layer (``LoiteringRule``) routes the detail dicts through
+    ``emit_alert`` so dedup, severity, and audit live in one place.
+    """
+
     def __init__(self, zones: list):
         self.zones = []
         for z in zones:
@@ -2135,20 +2144,36 @@ class ZoneEngine:
                 "dwell_sec": z["dwell_sec"], "dwell": {},
             })
 
-    def update(self, track_id: int, cx: int, cy: int, camera_id: str):
+    def observe(self, track_id: int, cx: int, cy: int):
+        """Yield one detail dict per zone whose dwell threshold trips this call.
+
+        Dwell timers are per-track-per-zone. Leaving a zone clears the
+        timer for that track. Re-firing inside a zone resets the timer
+        on each fire (so a long lingering track produces one detail
+        every ``dwell_sec`` seconds — central dedup smooths from there).
+
+        Args:
+            track_id: ByteTrack id (or 0 for untracked objects, matching
+                the legacy contract).
+            cx: Centroid x in inference-frame pixels.
+            cy: Centroid y.
+
+        Yields:
+            Detail dicts ready for ``emit_alert(camera, "loitering", ...)``.
+        """
         now = time.time()
         for z in self.zones:
             inside = cv2.pointPolygonTest(z["poly"], (cx, cy), False) >= 0
             if inside:
                 entered = z["dwell"].setdefault(track_id, now)
                 if now - entered >= z["dwell_sec"]:
-                    emit_alert(camera_id, "loitering", {
+                    yield {
                         "zone":      z["name"],
                         "track_id":  track_id,
                         "dwell_sec": round(now - entered, 1),
                         "label":     f"Loitering in {z['name']}",
                         "severity":  "medium",
-                    })
+                    }
                     z["dwell"][track_id] = now
             else:
                 z["dwell"].pop(track_id, None)
@@ -2344,10 +2369,11 @@ def run(cfg: dict):
     forbidden.start_reload_thread(interval_s=5.0)
 
     # ── Rules engine (Phase 1) ─────────────────────────────────────────────────
-    # Adds rules one phase at a time. Today: forbidden_zone only.
-    # Loitering, phone_use, detection, ppe land in subsequent phases.
+    # Adds rules one phase at a time. Today: forbidden_zone, loitering.
+    # phone_use, detection, ppe land in subsequent phases.
     rules_engine = RulesEngine([
         ForbiddenZoneRule(forbidden),
+        LoiteringRule(zones),
     ])
     log.info(
         "RULES engine ready: %s",
@@ -2545,10 +2571,8 @@ def run(cfg: dict):
                         track_id = -1
 
                     cx = int((x1 + x2) / 2); cy = int((y1 + y2) / 2)
-                    zones.update(
-                        track_id if track_id >= 0 else 0,
-                        cx, cy, cfg["camera_id"],
-                    )
+                    # Loitering moved to LoiteringRule (Phase 1c); evaluated
+                    # outside this loop via rules_engine.evaluate.
 
                     if not (0 <= cls < len(COCO_NAMES)):
                         continue
