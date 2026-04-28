@@ -203,10 +203,40 @@ CFG = {
 
     # ── Three-layer dedup windows (Session 5, Telegram-bound only) ──
     "dedup": {
-        "track_window_s":  300,    # 5 min — same (camera, track_id, kind)
-        "zone_window_s":   120,    # 2 min — same (camera, zone, kind)
+        "track_window_s":  300,    # 5 min — flat fallback (camera, track_id, kind)
+        "zone_window_s":   120,    # 2 min — flat fallback (camera, zone, kind)
         "burst_window_s":   30,    # rolling burst window
         "burst_threshold":   3,    # N within burst_window_s → fire summary
+
+        # Severity-aware overrides (Phase 0a). When a severity has an entry
+        # here it wins over the flat *_window_s fallback above; absent
+        # severities use the flat default. Real-intruder rule-of-thumb:
+        # CRITICAL must re-fire fast enough that a lingering trespasser
+        # produces multiple alerts, not one.
+        "track_window_by_severity_s": {
+            "CRITICAL":  30,
+            "HIGH":      60,
+            "MEDIUM":   180,
+            "LOW":      300,
+            "INFO":     300,
+        },
+        "zone_window_by_severity_s": {
+            "CRITICAL":  20,
+            "HIGH":      60,
+            "MEDIUM":   120,
+            "LOW":      120,
+            "INFO":     120,
+        },
+
+        # Track-loss re-fire (Phase 0a). When the tracker drops a track that
+        # previously fired, retire its dedup entries so a new track for the
+        # same logical situation can re-alert without waiting out the full
+        # window. `track_idle_s` is how long we tolerate a track being
+        # absent before declaring it lost. `clear_zone_on_track_loss` also
+        # clears the (camera, zone, kind) zone entry on retirement; False
+        # keeps the zone window as a backstop against rapid re-fire churn.
+        "track_idle_s":             5.0,
+        "clear_zone_on_track_loss": True,
     },
 }
 
@@ -815,6 +845,41 @@ _dedup_burst: "dict[tuple[str, str, str], collections.deque]" = (
 _dedup_lock = threading.Lock()
 _last_dedup_prune: float = 0.0
 
+# Phase 0a — track-activity ledger for track-loss re-fire.
+# (camera, track_id) → last frame ts the tracker reported this id.
+# Updated by _dedup_observe_tracks each frame from the main loop.
+_dedup_known_tracks: "dict[tuple[str, int], float]" = {}
+
+
+def _window_for_severity(
+    base_window_s: float,
+    severity: "Optional[str]",
+    by_severity_map: "Optional[dict]",
+) -> float:
+    """Pick the dedup window for this severity, falling back to base.
+
+    Pure helper. Severity is normalised to upper case before lookup.
+    Missing or unrecognised entries fall through to ``base_window_s``
+    so legacy configs without per-severity maps keep working.
+
+    Args:
+        base_window_s: Flat fallback (the legacy single-window value).
+        severity: Computed severity bucket, e.g. ``"CRITICAL"``.
+        by_severity_map: Optional dict of severity → window seconds.
+
+    Returns:
+        Window length in seconds, never less than zero.
+    """
+    if not by_severity_map or not severity:
+        return float(base_window_s)
+    val = by_severity_map.get(str(severity).upper())
+    if val is None:
+        return float(base_window_s)
+    try:
+        return max(0.0, float(val))
+    except (TypeError, ValueError):
+        return float(base_window_s)
+
 
 def _dedup_prune(now: float, track_w: float, zone_w: float) -> None:
     """Drop stale entries from track/zone dicts. Caller holds _dedup_lock."""
@@ -826,10 +891,104 @@ def _dedup_prune(now: float, track_w: float, zone_w: float) -> None:
         _dedup_zone.pop(k, None)
 
 
+def _dedup_retire_track(
+    camera: str,
+    track_id: int,
+    *,
+    clear_zone: bool = True,
+) -> None:
+    """Drop dedup entries for one (camera, track_id) pair.
+
+    Called when the tracker stops reporting a track that previously fired,
+    so a new track for the same logical situation can re-alert without
+    waiting out the full track window. Holds ``_dedup_lock`` internally —
+    safe to call from the main loop.
+
+    Args:
+        camera: camera id whose track is being retired.
+        track_id: ByteTrack id no longer being reported.
+        clear_zone: also drop matching ``(camera, zone, kind)`` zone-window
+            entries so the zone window does not block the re-fire.
+    """
+    with _dedup_lock:
+        # Drop every (camera, track_id, kind) row for this id.
+        stale = [k for k in _dedup_track if k[0] == camera and k[1] == track_id]
+        for k in stale:
+            kind = k[2]
+            _dedup_track.pop(k, None)
+            if clear_zone:
+                # We don't know which zone the previous fire used, so clear
+                # every zone-window entry for (camera, *, kind). Cheap —
+                # the dict is small and zones are bounded per camera.
+                zstale = [
+                    zk for zk in _dedup_zone
+                    if zk[0] == camera and zk[2] == kind
+                ]
+                for zk in zstale:
+                    _dedup_zone.pop(zk, None)
+        _dedup_known_tracks.pop((camera, track_id), None)
+
+
+def _dedup_observe_tracks(
+    camera: str,
+    active_track_ids: "set[int]",
+    now: float,
+    cfg: dict,
+) -> None:
+    """Update the track-activity ledger and retire idle tracks.
+
+    Called once per frame from the main loop with the set of track ids
+    the tracker reported in this frame. A track that has been silent for
+    longer than ``cfg["dedup"]["track_idle_s"]`` is retired
+    (dedup entries dropped). Pure observability when a track keeps being
+    seen — the cost is one dict update per active track per frame.
+
+    Args:
+        camera: camera id being observed (passed through, no inference).
+        active_track_ids: track ids reported in the current frame.
+        now: epoch seconds for "now". Pass ``time.time()`` from caller.
+        cfg: pipeline config dict (reads ``cfg["dedup"]`` only).
+    """
+    d = cfg.get("dedup", {})
+    idle_s = float(d.get("track_idle_s", 5.0))
+    clear_zone = bool(d.get("clear_zone_on_track_loss", True))
+
+    if idle_s <= 0:
+        # Track-loss re-fire disabled — keep the ledger empty.
+        return
+
+    # Refresh last-seen for the tracks present in this frame.
+    for tid in active_track_ids:
+        _dedup_known_tracks[(camera, int(tid))] = now
+
+    # Retire tracks idle longer than the threshold for this camera. We
+    # iterate a snapshot so concurrent retirements from other camera ids
+    # don't disturb iteration.
+    expired = [
+        (cam, tid)
+        for (cam, tid), last in list(_dedup_known_tracks.items())
+        if cam == camera and (now - last) > idle_s
+    ]
+    for (cam, tid) in expired:
+        _dedup_retire_track(cam, tid, clear_zone=clear_zone)
+
+
 def _dedup_filter(
     camera: str, kind: str, detail: dict, zone: str, cfg: dict,
+    severity: "Optional[str]" = None,
 ) -> "tuple[Optional[str], int]":
     """Run the three-layer Telegram-bound dedup filter chain.
+
+    Args:
+        camera: camera id.
+        kind: event kind.
+        detail: alert detail dict (read for ``track_id`` only).
+        zone: zone name; ``"main"`` until per-zone polygons land.
+        cfg: pipeline config dict (reads ``cfg["dedup"]``).
+        severity: optional computed severity bucket. When supplied, the
+            track / zone window length is selected from
+            ``dedup.track_window_by_severity_s`` /
+            ``dedup.zone_window_by_severity_s``. Absent → flat fallback.
 
     Returns:
         Tuple of (suppress_reason, burst_count_at_call_time).
@@ -845,19 +1004,43 @@ def _dedup_filter(
     """
     global _last_dedup_prune
     d = cfg.get("dedup", {})
-    track_w = float(d.get("track_window_s", 300))
-    zone_w = float(d.get("zone_window_s", 120))
+    track_base = float(d.get("track_window_s", 300))
+    zone_base = float(d.get("zone_window_s", 120))
     burst_w = float(d.get("burst_window_s", 30))
     burst_th = int(d.get("burst_threshold", 3))
+    track_w = _window_for_severity(
+        track_base, severity, d.get("track_window_by_severity_s"),
+    )
+    zone_w = _window_for_severity(
+        zone_base, severity, d.get("zone_window_by_severity_s"),
+    )
 
     track_id = detail.get("track_id")
     has_track = isinstance(track_id, int) and track_id >= 0
 
     now = time.time()
     with _dedup_lock:
-        # Periodic prune — synchronous, fast.
+        # Periodic prune — synchronous, fast. Use the LARGEST window
+        # across all severities so we never prune entries that are still
+        # within their severity's window.
         if now - _last_dedup_prune > 60:
-            _dedup_prune(now, track_w, zone_w)
+            t_max = max(
+                [track_base]
+                + [
+                    float(v)
+                    for v in (d.get("track_window_by_severity_s") or {}).values()
+                    if isinstance(v, (int, float))
+                ]
+            )
+            z_max = max(
+                [zone_base]
+                + [
+                    float(v)
+                    for v in (d.get("zone_window_by_severity_s") or {}).values()
+                    if isinstance(v, (int, float))
+                ]
+            )
+            _dedup_prune(now, t_max, z_max)
             _last_dedup_prune = now
 
         # 1. Track-aware
@@ -1454,7 +1637,7 @@ def emit_alert(camera_id: str, kind: str, detail: dict) -> None:
     # Telegram path runs the three-layer dedup filter first.
     if decision_route == "telegram":
         suppress_reason, burst_count = _dedup_filter(
-            camera_id, kind, detail, zone, CFG,
+            camera_id, kind, detail, zone, CFG, severity=severity,
         )
         if suppress_reason is not None:
             # Suppressed individuals → audit only, no events row.
@@ -2190,6 +2373,19 @@ def run(cfg: dict):
                     last_tracks = tracker.update(dets, frame)
                 else:
                     last_tracks = dets
+
+                # ── Track-loss re-fire ledger (Phase 0a) ───────────────────────
+                # Tell the dedup module which track ids are alive RIGHT NOW so
+                # it can retire entries for tracks the tracker has dropped.
+                # Without this, a 5-min lingering trespasser produces 1 alert
+                # then 100s of suppressed_dedup_track rows.
+                if tracker is not None:
+                    active_ids = {
+                        int(t[4])
+                        for t in last_tracks
+                        if len(t) > 6 and int(t[4]) >= 0
+                    }
+                    _dedup_observe_tracks(cfg["camera_id"], active_ids, now, cfg)
 
                 # ── Behavior submit (every Nth frame) ──────────────────────────
                 if beh_analyzer and n_frame % cfg["behavior_every_n"] == 0 and len(last_tracks):
