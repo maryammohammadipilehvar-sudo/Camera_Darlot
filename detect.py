@@ -77,7 +77,11 @@ CFG = {
     "yamnet_model":    "models/yamnet.tflite",
 
     # Thresholds
-    "yolo_conf":       0.55,
+    # yolo_conf lowered 0.55 → 0.40 in Session 9 to catch small objects
+    # (cell phones at 640×360 inference are typically 20–40px wide and
+    # below YOLO's natural confidence at 0.55). Watch for false-positive
+    # noise on detection / detection_summary kinds; revert if it spikes.
+    "yolo_conf":       0.40,
     "face_conf":       0.60,
     "face_sim_alert":  0.85,
     "face_sim_review": 0.60,
@@ -175,12 +179,14 @@ CFG = {
         # polygon. Operator brief: CRITICAL all modes.
         "forbidden_zone":     {"OCCUPIED": "CRITICAL", "CLOSED": "CRITICAL", "MAINTENANCE": "CRITICAL"},
         # Phone-use detected via YOLO cell-phone class (67) overlapping a
-        # person track. Bumped to MEDIUM × OCCUPIED in Session 9 so the
-        # operator gets a Telegram push during business hours; CLOSED stays
-        # MEDIUM (telegram); MAINTENANCE stays LOW (suppressed). Pair with
-        # the tighter phone_use_iou below — 0.05 fires on phone-on-desk
-        # near a sitting person, which is too noisy for Telegram.
-        "phone_use":          {"OCCUPIED": "MEDIUM",   "CLOSED": "MEDIUM",   "MAINTENANCE": "LOW"},
+        # person bbox. Bumped MEDIUM → HIGH in Session 9 follow-up — at
+        # MEDIUM the 180-second track-window dedup made the alerts feel
+        # random ("got a ping then 3 minutes of silence even though I'm
+        # still on the phone"). HIGH gets a 60-second window which feels
+        # responsive without Telegram-spamming. Routing unchanged for
+        # OCCUPIED/CLOSED (still telegram); MAINTENANCE upgrades from
+        # suppressed → dashboard so it's visible during maintenance windows.
+        "phone_use":          {"OCCUPIED": "HIGH",     "CLOSED": "HIGH",     "MAINTENANCE": "LOW"},
     },
 
     # ── Notification thresholds (Session 5) ───────────────────────
@@ -211,12 +217,25 @@ CFG = {
     "alert_kind_allowlist": ["forbidden_zone", "phone_use"],
 
     # ── Phone-use detection ────────────────────────────────────────
-    # IoU threshold for matching a YOLO cell-phone bbox against a
-    # person bbox. Tightened from 0.05 → 0.15 in Session 9 to reduce
-    # phone-on-desk false fires now that phone_use routes to Telegram.
-    # FOLLOWUPS suggested 0.15–0.30; start at the conservative end and
-    # tune up if real warehouse traffic still produces false positives.
-    "phone_use_iou":  0.15,
+    # phone_use_containment is the PRODUCTION metric: fraction of the
+    # phone bbox that overlaps the person bbox. ~1.0 when a phone is
+    # held in front of the body; near 0 when the phone is across the
+    # room from the person. IoU is unusable here because the phone is
+    # geometrically tiny next to a person (~1% of area) — IoU caps at
+    # ~0.01 even with full containment.
+    #
+    # Default 0.3 = "at least 30% of the phone overlaps the (padded)
+    # person bbox." Loose enough to handle bbox jitter when the phone
+    # is held at chest level; tighten toward 0.5+ if real warehouse
+    # traffic shows false positives.
+    "phone_use_containment":  0.3,
+    # Person bbox padding (pixels). YOLO's person bbox covers the
+    # torso/legs cleanly but often clips arms extended forward — so a
+    # phone held up at chest level lands just OUTSIDE the bare bbox.
+    # Padding by N pixels in every direction reclaims that area.
+    # 40 px @ 640×360 inference ≈ a fully-extended forearm. Bump to
+    # 60-80 if the user's arm reach extends further than that.
+    "phone_use_person_pad_px":  40,
 
     # ── Three-layer dedup windows (Session 5, Telegram-bound only) ──
     "dedup": {
@@ -2233,6 +2252,36 @@ def iou_xyxy(a, b):
     ub = max(0,bx2-bx1)*max(0,by2-by1)
     return inter / (ua+ub-inter+1e-6)
 
+
+def containment_xyxy(small, big) -> float:
+    """Fraction of ``small`` bbox area contained inside ``big`` bbox.
+
+    Used by the phone-use rule: a held phone is geometrically tiny
+    next to the person bbox (~1% of person area), so IoU caps at
+    ~0.01 even when the phone is 100% inside the person — which makes
+    IoU useless as a "phone in front of body" detector. Containment
+    answers the right question instead: "what fraction of the phone
+    is overlapping the person?". Returns a value in [0, 1] with 1.0
+    meaning ``small`` is fully inside ``big``.
+
+    Args:
+        small: ``(x1, y1, x2, y2)`` of the smaller bbox (e.g. phone).
+        big:   ``(x1, y1, x2, y2)`` of the larger bbox (e.g. person).
+
+    Returns:
+        Fraction of ``small``'s area contained in ``big``. ``0.0`` if
+        ``small`` has zero or negative area.
+    """
+    sx1, sy1, sx2, sy2 = small
+    bx1, by1, bx2, by2 = big
+    ix1 = max(sx1, bx1); iy1 = max(sy1, by1)
+    ix2 = min(sx2, bx2); iy2 = min(sy2, by2)
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    small_area = max(0, sx2 - sx1) * max(0, sy2 - sy1)
+    if small_area <= 0:
+        return 0.0
+    return inter / small_area
+
 def draw_tracks(frame, tracks):
     """Draw bounding box + class/track/confidence label per track.
 
@@ -2553,7 +2602,7 @@ def run(cfg: dict):
                     beh_analyzer.get_labels() if beh_analyzer else {}
                 )
 
-                # First pass: collect phone bboxes for the phone-use IoU check.
+                # First pass: collect phone bboxes for the phone-use check.
                 phone_bboxes: list = []
                 for t in last_tracks:
                     cls_t = int(t[6]) if (tracker is not None and len(t) > 6) else (
@@ -2562,7 +2611,8 @@ def run(cfg: dict):
                     if cls_t == 67:  # cell phone
                         phone_bboxes.append([int(t[0]), int(t[1]), int(t[2]), int(t[3])])
 
-                phone_iou = float(cfg.get("phone_use_iou", 0.05))
+                phone_containment = float(cfg.get("phone_use_containment", 0.3))
+                phone_pad = int(cfg.get("phone_use_person_pad_px", 40))
 
                 for t in last_tracks:
                     x1, y1, x2, y2 = int(t[0]), int(t[1]), int(t[2]), int(t[3])
@@ -2598,12 +2648,21 @@ def run(cfg: dict):
                     # suppressed_dedup_track rows by design (Section 8
                     # traceability).
                     if cls == 0 and phone_bboxes:
+                        # Pad person bbox to forgive arm-out cases — YOLO
+                        # often clips an extended forearm out of the
+                        # person box, leaving the held phone "just outside".
+                        padded_person = (
+                            bbox[0] - phone_pad, bbox[1] - phone_pad,
+                            bbox[2] + phone_pad, bbox[3] + phone_pad,
+                        )
                         for ph in phone_bboxes:
-                            if iou_xyxy(bbox, ph) > phone_iou:
+                            cont = containment_xyxy(ph, padded_person)
+                            if cont > phone_containment:
                                 emit_alert(cfg["camera_id"], "phone_use", {
                                     "track_id":  track_id if track_id >= 0 else None,
                                     "bbox":      bbox,
                                     "phone_bbox": ph,
+                                    "containment": round(cont, 3),
                                     "label":     "Phone use detected",
                                 })
                                 break
