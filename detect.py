@@ -54,6 +54,9 @@ import numpy as np
 import cv2
 import torch
 
+from rules import RuleContext, RulesEngine, TrackedObject
+from rules.forbidden_zone import ForbiddenZoneRule
+
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 
 os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp/Ultralytics")
@@ -2340,6 +2343,17 @@ def run(cfg: dict):
     )
     forbidden.start_reload_thread(interval_s=5.0)
 
+    # ── Rules engine (Phase 1) ─────────────────────────────────────────────────
+    # Adds rules one phase at a time. Today: forbidden_zone only.
+    # Loitering, phone_use, detection, ppe land in subsequent phases.
+    rules_engine = RulesEngine([
+        ForbiddenZoneRule(forbidden),
+    ])
+    log.info(
+        "RULES engine ready: %s",
+        ", ".join(r.name for r in rules_engine.rules) or "(none)",
+    )
+
     cam = open_camera(cfg["rtsp_url"])
 
     running        = True
@@ -2448,6 +2462,28 @@ def run(cfg: dict):
                     }
                     _dedup_observe_tracks(cfg["camera_id"], active_ids, now, cfg)
 
+                # ── Normalised tracks (Phase 1) ────────────────────────────────
+                # One pass over last_tracks builds the typed list every rule
+                # consumes. Decoder lives here so individual rules don't have
+                # to handle the with-tracker vs without-tracker shape variants.
+                tracked_objects: "list[TrackedObject]" = []
+                for t in last_tracks:
+                    x1_, y1_, x2_, y2_ = int(t[0]), int(t[1]), int(t[2]), int(t[3])
+                    if tracker is not None and len(t) > 6:
+                        tid_ = int(t[4]); conf_ = float(t[5]); cls_ = int(t[6])
+                    else:
+                        conf_ = float(t[4]) if len(t) > 4 else 0.0
+                        cls_ = int(t[5]) if len(t) > 5 else -1
+                        tid_ = -1
+                    tracked_objects.append(TrackedObject(
+                        track_id=tid_,
+                        bbox=(x1_, y1_, x2_, y2_),
+                        cls=cls_,
+                        conf=conf_,
+                        cx=(x1_ + x2_) // 2,
+                        cy=(y1_ + y2_) // 2,
+                    ))
+
                 # ── Behavior submit (every Nth frame) ──────────────────────────
                 if beh_analyzer and n_frame % cfg["behavior_every_n"] == 0 and len(last_tracks):
                     beh_analyzer.submit(frame, last_tracks, now)
@@ -2523,20 +2559,8 @@ def run(cfg: dict):
                     if cls == 67:
                         continue
 
-                    # ── Forbidden-zone check (person tracks only) ─────────
-                    # Fires per-frame while person is in zone; track-dedup
-                    # (5min window) collapses to one fired audit row. By design
-                    # — see Section 8 audit traceability.
-                    if cls == 0 and forbidden is not None:
-                        fz = forbidden.check(cx, cy)
-                        if fz is not None:
-                            emit_alert(cfg["camera_id"], "forbidden_zone", {
-                                "track_id":  track_id if track_id >= 0 else None,
-                                "zone":      fz["name"],
-                                "zone_id":   fz["id"],
-                                "bbox":      bbox,
-                                "label":     f"Person in forbidden zone: {fz['name']}",
-                            })
+                    # Forbidden-zone moved to ForbiddenZoneRule (Phase 1b);
+                    # evaluated outside this loop via rules_engine.evaluate.
 
                     # ── Phone-use check (person tracks only) ──────────────
                     # Fires per-frame while phone overlaps person; track-dedup
@@ -2572,6 +2596,26 @@ def run(cfg: dict):
                         "label":      f"{class_name} detected",
                         "severity":   "medium" if class_name == "person" else "low",
                     })
+
+                # ── Rules engine evaluation (Phase 1) ──────────────────────────
+                # All rules registered with rules_engine see the same
+                # per-frame context. Each result is dispatched through the
+                # central emit_alert pipeline (severity, dedup, audit, notify
+                # all stay in one place). Per-rule failures are logged but
+                # never propagate — the engine isolates them.
+                rule_ctx = RuleContext(
+                    camera_id=cfg["camera_id"],
+                    ts=now,
+                    n_frame=n_frame,
+                    mode=resolve_mode(cfg),
+                    cfg=cfg,
+                    tracks=tracked_objects,
+                    has_tracker=tracker is not None,
+                    action_by_track=action_by_track,
+                    frame=frame,
+                )
+                for _rule, _result in rules_engine.evaluate(rule_ctx):
+                    emit_alert(cfg["camera_id"], _result.kind, _result.detail)
 
             # ── FACE (disabled until ORT is stable on this Jetson) ─────────────
             # if face_det and n_frame % cfg["face_every_n"] == 0: ...
