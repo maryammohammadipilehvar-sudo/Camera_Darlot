@@ -4,29 +4,95 @@ Deferred work captured from audits and verification runs. Items here are
 intentionally not blocking the current change; each entry notes urgency and
 sufficient context to pick up in a future session.
 
-### alerts_only_forbidden_zone gate suppresses everything else (MEDIUM — review when re-tuning rules)
+### Phase 1d: pick PPE model + integrate ppe_violation rule (HIGH — first product feature)
 
-`CFG.alerts_only_forbidden_zone = True` (Session 7) silences every
-event kind except `forbidden_zone`. Phone-use, action-captioned
-detections, behavior alerts, thermal warnings, audio events,
-detection summaries — all build audit rows but never reach the
-events table, dashboard, or Telegram.
+The Phase 1 rules-engine slice (Sessions 9, 0a/0b/1a/1b/1c) shipped the
+scaffold and ported the two existing kinds (`forbidden_zone`,
+`loitering`). The next product step is the warehouse headline feature:
+**PPE compliance** (no hardhat / no hi-vis vest in operational zones).
 
-This was the operator's explicit ship-it call after the v2 rules
-session. Audit log still captures the decisions
-(`decision='suppressed_threshold'`,
-`reason_detail='alerts_only_forbidden_zone'`) so operators can
-later query "what would have fired?" and unfreeze on a per-kind
-basis.
+The architectural shape is settled — it's a `Rule` subclass that:
+1. Iterates `ctx.tracks`, filters `cls == 0` (person).
+2. Crops the upper body from `ctx.frame` per person.
+3. Runs a small classifier and yields `ppe_violation` when hardhat OR
+   vest is missing inside a zone tagged `ppe_required=True`.
 
-To relax: flip the CFG flag to `False`. Severity table + threshold
-table take over again — every kind routed per Session 5 rules.
-Pair the flip with a fresh foreground test, the previous-tuning
-session's results don't transfer once the gate moves.
+Open decisions before any code lands:
 
-Review trigger: any operator request that surfaces non-forbidden-
-zone information (e.g., "I want a daily report of detection
-counts" or "we need phone-use back").
+- **Model source.** Three realistic options:
+  * Augment YOLOv9-C with PPE classes (retrain + re-export TRT engine; ~4–8h GPU).
+  * Two-stage: keep current YOLOv9 + run a small per-person classifier
+    (HuggingFace `ppe-detection-yolov8s` or similar; ~30–100MB weights).
+  * SH17/CHV-trained YOLOv8n as a sibling detector on the same frames.
+- **Zone tagging.** Where do `ppe_required=True` zones live? Either
+  extend the `forbidden_zones` table with a `kind` column, or add a
+  separate `ppe_zones` table. Schema migration needed either way; pair
+  with the multi-camera schema work in `forbidden_zones lacks
+  camera_id column`.
+- **Severity table.** Add `ppe_violation` row. Suggested:
+  `OCCUPIED: HIGH, CLOSED: MEDIUM, MAINTENANCE: LOW`.
+- **Allowlist.** Add `"ppe_violation"` to `alert_kind_allowlist`
+  (currently `["forbidden_zone"]`) when ready to surface to operators.
+
+No code on this until the model decision lands. Don't pull weights
+without operator sign-off — they'll cost 30–150MB on the Jetson SSD
+and lock us into a particular dataset's class taxonomy.
+
+### Rules-engine: port phone_use + detection emits next (MEDIUM)
+
+After Phase 1c, the inline per-track loop in `detect.py` still emits
+`phone_use` and `detection` directly via `emit_alert`. Both are good
+candidates for the rules engine — the same pattern as
+`forbidden_zone` and `loitering`. Doing them together with PPE
+(Phase 1d) keeps the loop's structure clean: build `tracked_objects`
+once, then `rules_engine.evaluate(ctx)` is the single dispatch point.
+
+Until then the loop has two emit paths:
+- Inline (phone_use, detection, detection_summary).
+- Rules engine (forbidden_zone, loitering).
+
+Functionally fine, just two places to reason about.
+
+### `track_id == 0` collapse for untracked objects (LOW — parity preserved)
+
+`LoiteringRule` (Phase 1c) preserves the legacy
+`track_id if track_id >= 0 else 0` collapse from the original
+`zones.update` call. Untracked objects share id 0 in the dwell ledger,
+so two simultaneous untracked objects in the same zone overwrite each
+other's timers (AUDIT Risk #3 in the original audit).
+
+Today this rarely matters — ByteTrack is operational in production
+(commit `5a1b935`) and untracked detections are the exception, not
+the rule. Worth fixing properly when the multi-camera architecture
+lands; the right fix is to skip dwell entirely for `track_id < 0`
+rather than collapse to a shared id.
+
+
+
+### alerts_only_forbidden_zone gate replaced by alert_kind_allowlist (MEDIUM — review when re-tuning rules)
+
+**LIFTED (Session 9, commit cd684a1).** The legacy
+`CFG.alerts_only_forbidden_zone` boolean kill-switch is now
+`CFG.alert_kind_allowlist`:
+
+- `None`   → no gate; severity table alone routes.
+- `[]`     → silence every kind (audit-only).
+- `[...]`  → only listed kinds reach events / Telegram / dashboard.
+
+Production default is `["forbidden_zone"]` to preserve current
+behaviour. Legacy flag still honoured at startup with a deprecation
+log line; conflicting configs raise `ValueError` at import time.
+
+Audit-log query change: `reason_detail` for gated suppressions is
+now `'not_in_allowlist'`. Operators who grepped logs for
+`'alerts_only_forbidden_zone'` should update.
+
+Review trigger (unchanged from the original entry): any operator
+request that surfaces non-forbidden-zone information should add
+the relevant kind(s) to the allowlist OR set it to `None` to fully
+release the gate. Pair any release with a fresh foreground test —
+the Session 7 ship-it tuning was scoped to forbidden-zone-only
+traffic.
 
 ### phone_use IoU threshold tuning (LOW)
 
@@ -91,27 +157,27 @@ about when tuning rates.
 
 ### Track dedup over-suppresses sustained presence (HIGH)
 
-Session 5 foreground test (2026-04-27, 13:05–13:08, CLOSED mode):
-1 person walking in frame for 3 minutes produced 1 fired_telegram +
-419 suppressed_dedup_track. A real intruder lingering for 5+ minutes
-would only generate one alert under the current 5-minute track-aware
-window.
+**RESOLVED (Session 9, commit a33be94)**
 
-Rules tuning options to evaluate before customer deployment with
-real warehouse traffic:
+Two of the three options listed below shipped. Severity-aware windows
+(CRITICAL=30s, HIGH=60s, MEDIUM=180s, LOW=300s for the track window;
+20/60/120/120 for the zone window) plus track-loss-aware re-firing
+via `_dedup_observe_tracks` + `_dedup_retire_track`. Configurable
+via `cfg.dedup`. Backward compat preserved: absent severity maps fall
+back to the flat `track_window_s` / `zone_window_s` defaults.
 
-- Severity-aware dedup windows (e.g., CRITICAL=30s, HIGH=60s,
-  LOW=300s) so high-severity tracks re-fire faster than low ones.
-- Track-loss-aware re-firing: when a track_id is dropped and
-  recovered (or a new track_id appears in the same zone), reset
-  the dedup state for that kind.
-- Movement / zone-change re-firing: significant displacement in
-  bbox or polygon transitions triggers a re-alert even within the
-  dedup window.
+End-to-end coverage in `tests/test_dedup.py::test_track_loss_then_new_track_re_fires`
+mirrors the Session 5 pattern (track 5 fires + repeats are
+suppressed → tracker drops it → track 6 enters and fires fresh).
 
-Decide before customer deployment with real warehouse traffic.
-The 5-minute window was a deliberate noise-reduction choice for
-the bring-up; production behavior needs the tuning above.
+The third option (movement / zone-change re-firing) is not
+addressed. It is harder — needs a notion of "significant
+displacement" that doesn't false-fire on micro-jitter. Defer until
+production traffic shows the severity + track-loss treatment alone
+is insufficient. Today it almost certainly is: a real intruder
+lingering 5min produces a fresh CRITICAL fire every 30s, and a
+tracker break-and-re-acquire (the most common false-"lingering"
+pattern in production) clears dedup via track-loss observation.
 
 ### First-event snapshot race (LOW)
 
