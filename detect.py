@@ -186,13 +186,21 @@ CFG = {
         "INFO":     {"OCCUPIED": "suppressed", "CLOSED": "dashboard",  "MAINTENANCE": "suppressed"},
     },
 
-    # ── Operator gate: only forbidden_zone events surface ────────
-    # When True, every alert kind EXCEPT forbidden_zone is silenced —
-    # no events row, no Telegram, no dashboard. Audit log still
-    # records the decision so operators can later answer "what would
-    # have fired if we relaxed the rule?". Flip to False to restore
-    # the full severity-table-driven pipeline.
-    "alerts_only_forbidden_zone": True,
+    # ── Per-kind alert allowlist (Phase 0b) ───────────────────────
+    # Operator gate that constrains which event kinds surface to the
+    # operator, independent of the severity table. Three modes:
+    #   None   — no allowlist; severity table alone drives routing.
+    #   []     — empty list silences EVERY kind (audit-only mode).
+    #   [...]  — list of kind strings; only these reach events row,
+    #            Telegram, and dashboard. Everything else writes an
+    #            audit row (decision='suppressed_threshold',
+    #            reason_detail='not_in_allowlist') and short-circuits.
+    #
+    # Legacy "alerts_only_forbidden_zone": True is still honoured for
+    # backward compat — translates to ["forbidden_zone"] at startup
+    # with a one-time deprecation log line. Mixing both raises at
+    # import time so misconfigurations are loud, not subtle.
+    "alert_kind_allowlist": ["forbidden_zone"],
 
     # ── Phone-use detection ────────────────────────────────────────
     # IoU threshold for matching a YOLO cell-phone bbox against a
@@ -249,6 +257,63 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
 log = logging.getLogger("pipeline")
+
+
+# ─────────────────────────── ALLOWLIST LEGACY TRANSLATION ────────────────────
+# Honour the deprecated alerts_only_forbidden_zone flag if it's still set.
+# Conflicts (legacy key set AND new allowlist supplied) are noisy on
+# purpose — silently picking one would hide a real misconfiguration.
+def _resolve_alert_kind_allowlist(cfg: dict) -> "Optional[list]":
+    """Return the effective alert_kind_allowlist for the given cfg.
+
+    Reads ``cfg["alert_kind_allowlist"]`` and the legacy
+    ``cfg["alerts_only_forbidden_zone"]`` flag, logs a deprecation
+    one-shot if the legacy flag is in use, and raises if both keys
+    are set in conflicting ways.
+
+    Returns:
+        None to disable the gate, or a list of allowed kinds (possibly
+        empty to silence everything).
+    """
+    legacy = cfg.get("alerts_only_forbidden_zone")
+    new = cfg.get("alert_kind_allowlist", "__sentinel__")
+
+    if legacy is None and new == "__sentinel__":
+        return None  # neither set — gate disabled.
+
+    if legacy is None:
+        return None if new is None else list(new)
+
+    # Legacy key is set. Translate True/False; refuse to silently merge.
+    if new != "__sentinel__":
+        # New key explicitly present — only fine if the legacy flag is
+        # False (no-op) or the new value matches the legacy's translation.
+        translated = ["forbidden_zone"] if legacy else None
+        if new == translated:
+            log.warning(
+                "DEPRECATED: alerts_only_forbidden_zone=%s redundantly "
+                "duplicates alert_kind_allowlist=%r — drop the legacy "
+                "key from CFG", legacy, new,
+            )
+            return None if new is None else list(new)
+        raise ValueError(
+            "CFG has BOTH alerts_only_forbidden_zone=%r and "
+            "alert_kind_allowlist=%r and they disagree. Drop the "
+            "legacy flag — alert_kind_allowlist is authoritative."
+            % (legacy, new)
+        )
+
+    log.warning(
+        "DEPRECATED: alerts_only_forbidden_zone=%s — translating to "
+        "alert_kind_allowlist=%r. Update CFG to drop the legacy key.",
+        legacy, ["forbidden_zone"] if legacy else None,
+    )
+    return ["forbidden_zone"] if legacy else None
+
+
+# Module-level cache, set on first call. emit_alert reads this rather
+# than re-parsing CFG every event.
+_alert_kind_allowlist: "Optional[list]" = _resolve_alert_kind_allowlist(CFG)
 
 
 # ─────────────────────────── NOTIFIER MODULE ──────────────────────────────────
@@ -1597,19 +1662,15 @@ def emit_alert(camera_id: str, kind: str, detail: dict) -> None:
     severity = compute_severity(kind, detail, mode, CFG, zone=zone)
     decision_route = compute_decision(severity, mode, CFG)
 
-    # Operator gate: only forbidden_zone events surface to operators.
-    # Everything else gets an audit row (forensics — operator can query
-    # "what would have fired if we relaxed this?") then short-circuits
-    # before events row / Telegram / dashboard. Flip CFG flag to disable.
-    if (
-        CFG.get("alerts_only_forbidden_zone", False)
-        and kind != "forbidden_zone"
-    ):
+    # Operator gate: per-kind allowlist (Phase 0b). Replaces the legacy
+    # alerts_only_forbidden_zone kill-switch. Audit row still written so
+    # operators can query "what would have fired without the gate?".
+    if _alert_kind_allowlist is not None and kind not in _alert_kind_allowlist:
         _audit_write(
             event_id=None, camera_id=camera_id, kind=kind,
             computed_severity=severity, mode=mode,
             decision="suppressed_threshold",
-            reason_detail="alerts_only_forbidden_zone",
+            reason_detail="not_in_allowlist",
             zone=zone,
         )
         return
