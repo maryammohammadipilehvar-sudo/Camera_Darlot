@@ -1,0 +1,12 @@
+{
+  "_doc": "Forbidden-zone polygon recovered from corrupted sentinel_events.db on 2026-04-28. Bytes recovered via regex scan of the raw DB file; SQLite's own engine could not parse the page tree. After the DB is rebuilt, re-insert this polygon via the dashboard or via tools/restore_polygon.py.",
+  "name": "Forbidden zone",
+  "polygon": [
+    [0.1114496515730256, 0.6967205176122735],
+    [0.12668377660818736, 0.5033498104532741],
+    [0.2581783295432679, 0.5080375851722801],
+    [0.3399615271004522, 0.5982772485131466],
+    [0.3255291981197726, 0.7260191096060613],
+    [0.11545863184543659, 0.695548573932522]
+  ]
+}

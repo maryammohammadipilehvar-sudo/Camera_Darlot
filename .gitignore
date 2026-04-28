@@ -4,6 +4,12 @@ __pycache__/
 *.pyo
 *.bak
 *.db
+*.db-shm
+*.db-wal
+# Forensic snapshots from DB recovery (e.g. sentinel_events.db.broken_<ts>,
+# sentinel_events.db-wal.broken_<ts>). Pattern catches any file with
+# .broken_ in its name.
+*.broken_*
 backups/
 upgrade/
 *.pt
