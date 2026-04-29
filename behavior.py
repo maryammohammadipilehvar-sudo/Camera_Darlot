@@ -543,15 +543,29 @@ _ACTION_DISPLAY = {
 }
 
 
-def draw_behavior(frame: np.ndarray, tracks: np.ndarray, labels: Dict[int, dict]):
-    """Overlay action labels for non-routine behavior only.
+_BEH_LABEL_FONT = cv2.FONT_HERSHEY_DUPLEX
 
-    Routine actions (standing / walking / unknown) get NO overlay so the
-    annotated frame stays readable. Non-routine actions render with the
-    ACTION_COLORS-driven color and a Title-Case word.
+
+def _ideal_fg(bg) -> Tuple[int, int, int]:
+    b, g, r = bg
+    luma = 0.299 * r + 0.587 * g + 0.114 * b
+    return (20, 20, 20) if luma > 160 else (255, 255, 255)
+
+
+def draw_behavior(frame: np.ndarray, tracks: np.ndarray, labels: Dict[int, dict]):
+    """Overlay action chips for non-routine behavior only.
+
+    Routine actions (standing / walking / sitting / unknown) get NO
+    overlay so the annotated frame stays readable. Non-routine actions
+    render as a filled chip below the bbox with the ACTION_COLORS fill
+    and auto-contrast text — readable on any background.
     """
     if not labels or tracks is None or len(tracks) == 0:
         return
+    h, w = frame.shape[:2]
+    font_scale = 0.6
+    thickness = 1
+    pad_x, pad_y = 8, 5
     for t in tracks:
         if len(t) < 5:
             continue
@@ -563,7 +577,26 @@ def draw_behavior(frame: np.ndarray, tracks: np.ndarray, labels: Dict[int, dict]
         if not action or action in _ROUTINE_ACTIONS:
             continue
         x1, y2 = int(t[0]), int(t[3])
-        color = ACTION_COLORS.get(action, (200, 200, 200))
-        text  = _ACTION_DISPLAY.get(action, str(action).title())
-        cv2.putText(frame, text, (x1, y2+15),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
+        bg = ACTION_COLORS.get(action, (200, 200, 200))
+        text = _ACTION_DISPLAY.get(action, str(action).title())
+
+        (tw, th), _ = cv2.getTextSize(text, _BEH_LABEL_FONT, font_scale, thickness)
+        chip_w = tw + pad_x * 2
+        chip_h = th + pad_y * 2
+        cx1, cy1 = x1, y2 + 4
+        cx2, cy2 = cx1 + chip_w, cy1 + chip_h
+        if cx2 > w:
+            shift = cx2 - w
+            cx1 -= shift; cx2 -= shift
+        if cx1 < 0:
+            cx1, cx2 = 0, chip_w
+        if cy2 > h:
+            cy2 = h
+            cy1 = max(0, cy2 - chip_h)
+        fg = _ideal_fg(bg)
+        cv2.rectangle(frame, (cx1, cy1), (cx2, cy2), bg, -1, cv2.LINE_AA)
+        cv2.rectangle(frame, (cx1, cy1), (cx2, cy2), (10, 10, 10), 1, cv2.LINE_AA)
+        cv2.putText(
+            frame, text, (cx1 + pad_x, cy2 - pad_y),
+            _BEH_LABEL_FONT, font_scale, fg, thickness, cv2.LINE_AA,
+        )

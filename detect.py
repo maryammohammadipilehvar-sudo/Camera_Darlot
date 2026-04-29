@@ -2307,8 +2307,96 @@ def containment_xyxy(small, big) -> float:
         return 0.0
     return inter / small_area
 
+_LABEL_FONT = cv2.FONT_HERSHEY_DUPLEX
+
+
+def _ideal_fg_for(bg) -> tuple:
+    """Pick black or white text for the best contrast against ``bg``.
+
+    Uses the ITU-R BT.601 luma approximation (no gamma correction —
+    cheap and good enough for label legibility). bg is BGR.
+    """
+    b, g, r = bg
+    luma = 0.299 * r + 0.587 * g + 0.114 * b
+    return (20, 20, 20) if luma > 160 else (255, 255, 255)
+
+
+def draw_label_chip(
+    frame,
+    text: str,
+    anchor,
+    bg,
+    *,
+    font_scale: float = 0.6,
+    thickness: int = 1,
+    pad_x: int = 8,
+    pad_y: int = 5,
+    above: bool = True,
+) -> None:
+    """Render ``text`` inside a filled, high-contrast chip.
+
+    The chip is drawn flush against ``anchor`` (an ``(x, y)`` point on
+    the bbox edge). When ``above`` is True the chip sits ABOVE the
+    anchor with its bottom-left at the anchor; otherwise it sits BELOW
+    with its top-left at the anchor. Foreground text colour is chosen
+    automatically (black/white) for legibility against ``bg``.
+
+    Args:
+        frame: BGR image to draw on, mutated in place.
+        text: label text.
+        anchor: ``(x, y)`` point — typically a bbox corner.
+        bg: chip fill colour (BGR). Black 1px outline is added so the
+            chip stays visible against same-coloured backgrounds.
+        font_scale: cv2 putText scale; 0.6 is the operator-view default.
+        thickness: stroke thickness for the text.
+        pad_x: horizontal padding around the text inside the chip.
+        pad_y: vertical padding around the text inside the chip.
+        above: True to place chip above the anchor (text label above a
+            bbox), False to place below (e.g. behavior label).
+    """
+    if not text:
+        return
+    h, w = frame.shape[:2]
+    ax, ay = int(anchor[0]), int(anchor[1])
+
+    (tw, th), baseline = cv2.getTextSize(text, _LABEL_FONT, font_scale, thickness)
+    chip_w = tw + pad_x * 2
+    chip_h = th + pad_y * 2
+
+    if above:
+        x1, y1 = ax, ay - chip_h
+        x2, y2 = ax + chip_w, ay
+        text_y = y2 - pad_y
+    else:
+        x1, y1 = ax, ay
+        x2, y2 = ax + chip_w, ay + chip_h
+        text_y = y2 - pad_y
+
+    # Clamp to frame so chips on screen edges still fully render.
+    if x2 > w:
+        shift = x2 - w
+        x1 -= shift; x2 -= shift
+    if x1 < 0:
+        x1, x2 = 0, x2 - x1
+    if y1 < 0:
+        y1, y2 = 0, chip_h
+        text_y = y2 - pad_y
+    if y2 > h:
+        y2 = h
+        y1 = max(0, y2 - chip_h)
+        text_y = y2 - pad_y
+
+    fg = _ideal_fg_for(bg)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), bg, -1, cv2.LINE_AA)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), (10, 10, 10), 1, cv2.LINE_AA)
+    cv2.putText(
+        frame, text, (x1 + pad_x, text_y),
+        _LABEL_FONT, font_scale, fg, thickness, cv2.LINE_AA,
+    )
+
+
 def draw_tracks(frame, tracks):
-    """Draw a clean bounding box + class name per track.
+    """Draw a clean bounding box + class-name chip per track.
 
     Track id and confidence are intentionally omitted from the on-screen
     label — they're useful for debugging but cluttered for an operator-
@@ -2326,21 +2414,22 @@ def draw_tracks(frame, tracks):
         name = COCO_NAMES[cls] if 0 <= cls < len(COCO_NAMES) else ""
         lbl  = name.title() if name else ""
 
-        cv2.rectangle(frame, (x1, y1), (x2, y2), c, 2)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), c, 3)
         if lbl:
-            cv2.putText(frame, lbl, (x1, y1 - 6),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, c, 1, cv2.LINE_AA)
+            draw_label_chip(frame, lbl, (x1, y1), c, font_scale=0.6, thickness=1)
 
 def draw_faces(frame, faces, labels):
-    for (x1,y1,x2,y2,_), label in zip(faces, labels):
-        cv2.rectangle(frame, (x1,y1), (x2,y2), (255,200,0), 2)
-        # AUTO_CLEAN_LABEL
+    """Draw a face bbox + identity chip per detected face."""
+    face_color = (255, 200, 0)  # cyan-amber, distinct from track colors
+    for (x1, y1, x2, y2, _), label in zip(faces, labels):
+        cv2.rectangle(frame, (x1, y1), (x2, y2), face_color, 3)
         try:
             label = _clean_behavior_label(_clean_behavior_label(label))
         except Exception:
             pass
-        cv2.putText(frame, label, (x1, y1-6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255,200,0), 1, cv2.LINE_AA)
+        if label:
+            draw_label_chip(frame, label, (x1, y1), face_color,
+                            font_scale=0.55, thickness=1)
 
 def draw_forbidden_zones(frame, zones: list) -> None:
     """Outline every persisted forbidden polygon in red on the live feed.
@@ -2364,14 +2453,17 @@ def draw_forbidden_zones(frame, zones: list) -> None:
 
 
 def draw_anomaly(frame, score: float):
-    """Show a clean ANOMALY banner when score exceeds the threshold.
+    """Show a high-contrast ANOMALY banner when score exceeds threshold.
 
-    Numeric score is intentionally omitted — operators don't act on the
-    raw value; the audit log keeps it for forensics.
+    Drawn as a filled red chip in the top-left so it reads even on dark
+    scenes. Numeric score is intentionally omitted — operators don't
+    act on the raw value; the audit log keeps it for forensics.
     """
     if score > CFG["anomaly_thresh"]:
-        cv2.putText(frame, "ANOMALY", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
+        draw_label_chip(
+            frame, "ANOMALY", (12, 50), (0, 0, 220),
+            font_scale=0.95, thickness=2, pad_x=14, pad_y=8,
+        )
 
 def draw_hud(frame, fps: float, n_tracks: int, thermal: float):
     """No-op — every HUD element is now suppressed on the live view.
