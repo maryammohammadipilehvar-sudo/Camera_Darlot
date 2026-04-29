@@ -2358,15 +2358,9 @@ def draw_forbidden_zones(frame, zones: list) -> None:
         cv2.addWeighted(overlay, 0.18, frame, 0.82, 0, dst=frame)
         cv2.polylines(frame, [poly], isClosed=True,
                       color=(40, 40, 220), thickness=2, lineType=cv2.LINE_AA)
-        # Label centered on the polygon centroid.
-        m = cv2.moments(poly)
-        if m["m00"]:
-            cx = int(m["m10"] / m["m00"]); cy = int(m["m01"] / m["m00"])
-            txt = str(z.get("name") or "")
-            if txt:
-                cv2.putText(frame, txt, (cx - 30, cy),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45,
-                            (255, 255, 255), 1, cv2.LINE_AA)
+        # Zone name intentionally not rendered on the live view —
+        # the colored fill already communicates "this is a forbidden
+        # area"; the human-readable name lives in events / dashboard.
 
 
 def draw_anomaly(frame, score: float):
@@ -2380,19 +2374,14 @@ def draw_anomaly(frame, score: float):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
 
 def draw_hud(frame, fps: float, n_tracks: int, thermal: float):
-    """Bottom-right timestamp.
+    """No-op — every HUD element is now suppressed on the live view.
 
-    fps / track count / thermal kept as parameters for caller stability,
-    but no longer rendered on-screen — they're available on the /health
-    endpoint and dashboard for anyone who wants the diagnostic numbers.
+    Parameters are kept for caller stability so the main loop's
+    annotation block doesn't need to change. Diagnostic numbers (fps /
+    tracks / thermal) and the wall-clock timestamp are all available on
+    the /health endpoint and the dashboard.
     """
-    txt = time.strftime("%Y-%m-%d %H:%M:%S")
-    h, w = frame.shape[:2]
-    (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-    x = w - tw - 10
-    y = h - 10
-    cv2.putText(frame, txt, (x, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1, cv2.LINE_AA)
+    return
 
 
 # ─────────────────────────── MAIN LOOP ────────────────────────────────────────
