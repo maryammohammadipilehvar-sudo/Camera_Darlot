@@ -161,6 +161,26 @@ body::after{content:'';position:fixed;inset:0;
 .kpi-l{font-size:8px;letter-spacing:1.5px;color:var(--text3);margin-top:1px}
 
 .hdr-right{display:flex;align-items:center;gap:10px;flex-shrink:0}
+
+/* ─── Top-bar view tabs ───────────────────────────────────────────────────── */
+.view-tabs{display:flex;gap:4px;background:var(--bg3);
+  border:1px solid var(--border);border-radius:6px;padding:3px;flex-shrink:0}
+.view-tab{background:none;border:none;color:var(--text2);
+  font-family:var(--font-ui);font-size:12px;font-weight:600;letter-spacing:1.4px;
+  padding:6px 16px;border-radius:4px;cursor:pointer;
+  transition:background .18s,color .18s;text-transform:uppercase}
+.view-tab:hover{color:var(--text)}
+.view-tab.active{background:var(--accent);color:#04110a;
+  box-shadow:0 0 12px var(--accent-glow)}
+
+/* ─── View containers ─────────────────────────────────────────────────────── */
+#view-live, #view-history{flex:1;min-height:0;display:flex;flex-direction:column}
+#view-history{padding:var(--gap);overflow:hidden}
+#view-history.hidden, #view-live.hidden{display:none}
+
+/* History view (full-screen mode) — overrides the embedded panel sizing
+   when shown as its own tab so the table breathes. */
+#view-history #history-panel{margin:0;height:100%;flex:1}
 .icon-btn{background:none;border:1px solid var(--border);color:var(--text3);
   padding:4px 9px;border-radius:var(--r);cursor:pointer;font-size:13px;
   transition:all .2s}
@@ -521,11 +541,19 @@ td.trunc{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
     <div class="sep"></div>
 
+    <nav class="view-tabs" role="tablist" aria-label="Dashboard views">
+      <button class="view-tab active" id="tab-live"    type="button" role="tab" aria-selected="true">Live</button>
+      <button class="view-tab"        id="tab-history" type="button" role="tab" aria-selected="false">History</button>
+    </nav>
+
     <div class="hdr-right">
       <button class="icon-btn" id="btn-notif" title="Browser notifications">🔔</button>
       <div id="clock">--:--:--</div>
     </div>
   </header>
+
+  <!-- ── LIVE VIEW (default tab) ─────────────────────────────────────────────── -->
+  <div id="view-live">
 
   <!-- ── MAIN GRID ──────────────────────────────────────────────────────────── -->
   <div id="main-grid">
@@ -585,6 +613,11 @@ td.trunc{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
   </div><!-- #main-grid -->
 
+  </div><!-- #view-live -->
+
+  <!-- ── HISTORY VIEW (separate tab) ─────────────────────────────────────────── -->
+  <div id="view-history" class="hidden">
+
   <!-- ── HISTORY PANEL ───────────────────────────────────────────────────────── -->
   <section class="panel" id="history-panel">
     <div class="panel-head">
@@ -605,7 +638,8 @@ td.trunc{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
         <input type="date" id="f-start" class="f-inp" title="From">
         <input type="date" id="f-end"   class="f-inp" title="To">
         <button class="sb accent" id="btn-filter">⌕ Filter</button>
-        <button class="sb" id="btn-export">↓ CSV</button>
+        <button class="sb" id="btn-export"      title="Download filtered events as CSV">↓ CSV</button>
+        <button class="sb" id="btn-export-json" title="Download filtered events as JSON">↓ JSON</button>
       </div>
     </div>
 
@@ -627,10 +661,12 @@ td.trunc{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
     <div class="pager">
       <button class="pg-btn" id="pg-prev">‹ Prev</button>
-      <span id="pg-info" style="font-family:var(--font-mono);font-size:10px"></span>
+      <span id="pg-info" style="font-family:var(--font-mono);font-size:13px"></span>
       <button class="pg-btn" id="pg-next">Next ›</button>
     </div>
   </section>
+
+  </div><!-- #view-history -->
 
 </div><!-- #app -->
 
@@ -1672,6 +1708,29 @@ function initControls(){
     const p=Math.ceil(S.total/PAGE);if(S.page<p-1){S.page++;fetchHist()}
   };
   document.getElementById('btn-export').onclick=exportCSV;
+  document.getElementById('btn-export-json').onclick=exportJSON;
+  // Top-bar view tabs — Live ↔ History. Selection persists across reloads.
+  const showView = (name) => {
+    const live    = document.getElementById('view-live');
+    const history = document.getElementById('view-history');
+    const tLive   = document.getElementById('tab-live');
+    const tHist   = document.getElementById('tab-history');
+    const isHistory = name === 'history';
+    live.classList.toggle('hidden', isHistory);
+    history.classList.toggle('hidden', !isHistory);
+    tLive.classList.toggle('active', !isHistory);
+    tHist.classList.toggle('active',  isHistory);
+    tLive.setAttribute('aria-selected', String(!isHistory));
+    tHist.setAttribute('aria-selected', String( isHistory));
+    try { localStorage.setItem('sentinel.view', name); } catch {}
+    if (isHistory) fetchHist();
+  };
+  document.getElementById('tab-live').onclick    = () => showView('live');
+  document.getElementById('tab-history').onclick = () => showView('history');
+  try {
+    const saved = localStorage.getItem('sentinel.view');
+    if (saved === 'history') showView('history');
+  } catch {}
   document.addEventListener('keydown',e=>{
     const m = document.getElementById('modal');
     const modalOpen = m && !m.classList.contains('hidden');
@@ -1694,24 +1753,59 @@ function initControls(){
   });
 }
 
-// ── CSV Export ────────────────────────────────────────────────────────────────
-async function exportCSV(){
+// ── Export ────────────────────────────────────────────────────────────────────
+// Both exporters re-fetch with the active filters at limit=9999 so the file
+// matches what the operator just filtered to, not just the 60 visible rows.
+function _exportFilterParams(){
   const {kind,cam,start,end}=S.filters;
   const p=new URLSearchParams({limit:9999,offset:0});
   if(kind)p.set('kind',kind);if(cam)p.set('camera',cam);
   if(start)p.set('start',new Date(start).getTime()/1000);
   if(end)  p.set('end',(new Date(end).getTime()/1000)+86399);
+  return p;
+}
+
+function _saveBlob(blob, filename){
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download=filename;
+  a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href), 1000);
+}
+
+async function exportCSV(){
   try{
-    const d=await fetch('/api/events?'+p).then(r=>r.json());
+    const d=await fetch('/api/events?'+_exportFilterParams()).then(r=>r.json());
     const rows=[['id','timestamp','camera','kind','detail'],...d.events.map(ev=>{
       const det=typeof ev.detail==='string'?ev.detail:JSON.stringify(ev.detail);
       return [ev.id,fmtTs(ev.ts),ev.camera,ev.kind,`"${det.replace(/"/g,'""')}"`];
     })];
     const blob=new Blob([rows.map(r=>r.join(',')).join('\n')],{type:'text/csv'});
-    const a=document.createElement('a');
-    a.href=URL.createObjectURL(blob);
-    a.download=`sentinel_${new Date().toISOString().slice(0,10)}.csv`;
-    a.click();
+    _saveBlob(blob, `sentinel_${new Date().toISOString().slice(0,10)}.csv`);
+  }catch(e){alert('Export failed: '+e)}
+}
+
+async function exportJSON(){
+  try{
+    const d=await fetch('/api/events?'+_exportFilterParams()).then(r=>r.json());
+    const events=(d.events||[]).map(ev=>({
+      id:       ev.id,
+      ts:       ev.ts,
+      timestamp:fmtTs(ev.ts),
+      camera:   ev.camera,
+      kind:     ev.kind,
+      severity: ev.detail && ev.detail.severity || null,
+      detail:   typeof ev.detail==='string' ? tryParse(ev.detail) : ev.detail,
+    }));
+    const payload={
+      exported_at: new Date().toISOString(),
+      filter:      Object.fromEntries(_exportFilterParams()),
+      count:       events.length,
+      events,
+    };
+    const blob=new Blob([JSON.stringify(payload, null, 2)],
+                        {type:'application/json'});
+    _saveBlob(blob, `sentinel_${new Date().toISOString().slice(0,10)}.json`);
   }catch(e){alert('Export failed: '+e)}
 }
 
