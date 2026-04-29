@@ -2631,6 +2631,30 @@ def run(cfg: dict):
                     beh_analyzer.get_labels() if beh_analyzer else {}
                 )
 
+                # ── Publish snapshot frame BEFORE emits ────────────────
+                # The bottom-of-loop annotation block runs after alerts
+                # fire, so without this an event triggered on frame N
+                # would save the previously-published `vis` (frame N-1
+                # or older). For events like phone_use that depend on a
+                # transient overlap, the saved JPEG often showed nobody
+                # using the phone. Annotating once here on the SAME
+                # frame whose detections produced the event makes the
+                # snapshot match what the rule actually saw.
+                vis_snap = frame.copy()
+                draw_forbidden_zones(vis_snap, forbidden.all_polys())
+                draw_tracks(vis_snap, last_tracks)
+                if beh_analyzer:
+                    try:
+                        from behavior import draw_behavior
+                        draw_behavior(vis_snap, last_tracks, action_by_track)
+                    except Exception:
+                        pass
+                draw_faces(vis_snap, last_faces, last_labels)
+                draw_anomaly(vis_snap, last_anomaly)
+                draw_hud(vis_snap, fps, len(last_tracks), _health.get("thermal_c", 0.0))
+                global _snapshot_frame
+                _snapshot_frame = vis_snap
+
                 # First pass: collect phone bboxes for the phone-use check.
                 phone_bboxes: list = []
                 for t in last_tracks:
@@ -2643,7 +2667,35 @@ def run(cfg: dict):
                 phone_containment = float(cfg.get("phone_use_containment", 0.3))
                 phone_pad = int(cfg.get("phone_use_person_pad_px", 40))
 
-                for t in last_tracks:
+                # Single-owner phone assignment: each phone fires phone_use
+                # for AT MOST one person — the one whose padded bbox best
+                # contains it. Without this, two adjacent persons (e.g. ids
+                # 9 and 10 standing close) both have padded boxes that pass
+                # the containment threshold, so the phone_use alert lands
+                # on whichever track was iterated first instead of the
+                # actual phone holder.
+                phone_owner_idx: list = []  # parallel to phone_bboxes; -1 = unowned
+                for ph in phone_bboxes:
+                    best_idx = -1
+                    best_cont = phone_containment  # must beat the threshold
+                    for idx_p, t in enumerate(last_tracks):
+                        cls_p = int(t[6]) if (tracker is not None and len(t) > 6) else (
+                            int(t[5]) if len(t) > 5 else -1
+                        )
+                        if cls_p != 0:
+                            continue
+                        bx1, by1, bx2, by2 = int(t[0]), int(t[1]), int(t[2]), int(t[3])
+                        padded_p = (
+                            bx1 - phone_pad, by1 - phone_pad,
+                            bx2 + phone_pad, by2 + phone_pad,
+                        )
+                        c = containment_xyxy(ph, padded_p)
+                        if c > best_cont:
+                            best_cont = c
+                            best_idx = idx_p
+                    phone_owner_idx.append(best_idx)
+
+                for _track_idx, t in enumerate(last_tracks):
                     x1, y1, x2, y2 = int(t[0]), int(t[1]), int(t[2]), int(t[3])
                     bbox = [x1, y1, x2, y2]
 
@@ -2675,26 +2727,27 @@ def run(cfg: dict):
                     # (5min window) collapses to one fired audit row. Same
                     # pattern as detection events. Audit log will show
                     # suppressed_dedup_track rows by design (Section 8
-                    # traceability).
+                    # traceability). Ownership was decided above — at most
+                    # one person fires per phone, even if several persons'
+                    # padded bboxes overlap it.
                     if cls == 0 and phone_bboxes:
-                        # Pad person bbox to forgive arm-out cases — YOLO
-                        # often clips an extended forearm out of the
-                        # person box, leaving the held phone "just outside".
                         padded_person = (
                             bbox[0] - phone_pad, bbox[1] - phone_pad,
                             bbox[2] + phone_pad, bbox[3] + phone_pad,
                         )
-                        for ph in phone_bboxes:
+                        for ph_i, owner_idx in enumerate(phone_owner_idx):
+                            if owner_idx != _track_idx:
+                                continue
+                            ph = phone_bboxes[ph_i]
                             cont = containment_xyxy(ph, padded_person)
-                            if cont > phone_containment:
-                                emit_alert(cfg["camera_id"], "phone_use", {
-                                    "track_id":  track_id if track_id >= 0 else None,
-                                    "bbox":      bbox,
-                                    "phone_bbox": ph,
-                                    "containment": round(cont, 3),
-                                    "label":     "Phone use detected",
-                                })
-                                break
+                            emit_alert(cfg["camera_id"], "phone_use", {
+                                "track_id":  track_id if track_id >= 0 else None,
+                                "bbox":      bbox,
+                                "phone_bbox": ph,
+                                "containment": round(cont, 3),
+                                "label":     "Phone use detected",
+                            })
+                            break
 
                     # Action cache stamp — pure read, no mutation. Stale by
                     # a few hundred ms is fine; analyzer prunes on its own.
@@ -2766,8 +2819,10 @@ def run(cfg: dict):
             draw_hud(vis, fps, len(last_tracks), _health.get("thermal_c", 0.0))
 
             # Publish the fully-annotated frame for snapshot capture.
-            # Atomic reference rebind under the GIL; consumers .copy() before use.
-            global _snapshot_frame
+            # Atomic reference rebind under the GIL; consumers .copy()
+            # before use. Background-thread alerts (e.g. thermal) read
+            # this; in-loop alerts read the earlier publish made before
+            # emits, so they match the frame that triggered them.
             _snapshot_frame = vis
 
             ok, jpg = cv2.imencode(
