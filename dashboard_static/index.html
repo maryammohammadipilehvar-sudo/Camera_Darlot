@@ -39,9 +39,19 @@ button,select,input{font-family:inherit}
   --yellow:    #ffd84d;
   --yellow-d:  rgba(255,216,77,.12);
 
-  --text:  #d7e6f5;
+  --text:  #e8eef5;
   --text2: #89a3bb;
   --text3: #4e6a82;
+
+  /* Severity-tinted body text. Used for the event detail line so the
+     reader's eye lands on critical / high rows in a long list. Softer
+     than the saturated --red / --yellow used for borders + badges so
+     long lines stay legible rather than screaming. */
+  --sev-crit-text: #ff8a8a;
+  --sev-high-text: #ffd84d;
+  --sev-med-text:  #9bd0ff;
+  --sev-low-text:  #9be6c2;
+  --sev-info-text: #e8eef5;
 
   --font-ui:   'Exo 2',system-ui,sans-serif;
   --font-mono: 'Share Tech Mono','Courier New',monospace;
@@ -281,6 +291,12 @@ body::after{content:'';position:fixed;inset:0;
   font-family:var(--font-mono)}
 .ev-detail{font-size:14px;color:var(--text);overflow:hidden;
   text-overflow:ellipsis;white-space:nowrap;font-weight:500;line-height:1.4}
+/* Severity-driven detail color — matches the card accent bar. */
+.sev-t-critical{color:var(--sev-crit-text)}
+.sev-t-high    {color:var(--sev-high-text)}
+.sev-t-medium  {color:var(--sev-med-text)}
+.sev-t-low     {color:var(--sev-low-text)}
+.sev-t-info    {color:var(--sev-info-text)}
 
 /* ─── Badges ──────────────────────────────────────────────────────────────── */
 .badge{display:inline-block;padding:2px 8px;border-radius:3px;
@@ -842,7 +858,7 @@ function renderFeed(){
           <span class="ev-cam">${cam}</span>
           <span class="ev-time">${t}</span>
         </div>
-        <div class="ev-detail">${s}</div>
+        <div class="ev-detail sev-t-${sev}">${s}</div>
       </div>
     </div>`;
   }).join('');
@@ -859,12 +875,13 @@ function renderHist(evts){
     const s=summary(ev);
     const timeTxt = ev.display_time || fmtTs(ev.ts);
     const cam = ev.display_camera || ev.camera || '';
+    const sev = severityOf(ev);
     return `<tr>
       <td class="mono dim">${ev.id}</td>
       <td class="mono">${timeTxt}</td>
       <td>${cam}</td>
       <td><span class="badge ${m.cls}">${m.lbl}</span></td>
-      <td class="trunc">${s||'<span style="color:var(--text3)">—</span>'}</td>
+      <td class="trunc sev-t-${sev}">${s||'<span style="color:var(--text3)">—</span>'}</td>
       <td><button class="sb" onclick='openModal(${esc(ev)})'>view</button></td>
     </tr>`;
   }).join('');
