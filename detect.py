@@ -2308,26 +2308,28 @@ def containment_xyxy(small, big) -> float:
     return inter / small_area
 
 def draw_tracks(frame, tracks):
-    """Draw bounding box + class/track/confidence label per track.
+    """Draw a clean bounding box + class name per track.
 
-    Behavior overlays are owned by ``behavior.draw_behavior`` and rendered
-    separately below the bbox; this function never reads the behavior
-    label dict.
+    Track id and confidence are intentionally omitted from the on-screen
+    label — they're useful for debugging but cluttered for an operator-
+    facing view. The track id is still attached to every emitted event,
+    so audit/dedup behavior is unchanged. Behavior overlays are owned by
+    ``behavior.draw_behavior``.
     """
     if tracks is None or len(tracks) == 0:
         return
     for t in tracks:
         x1, y1, x2, y2 = int(t[0]), int(t[1]), int(t[2]), int(t[3])
-        tid  = int(t[4])
-        cls  = int(t[6]) if len(t) > 6 else -1
-        conf = float(t[5]) if len(t) > 5 else 0.0
-        c    = _color(tid)
-        name = COCO_NAMES[cls] if 0 <= cls < len(COCO_NAMES) else "?"
+        tid = int(t[4])
+        cls = int(t[6]) if len(t) > 6 else -1
+        c   = _color(tid)
+        name = COCO_NAMES[cls] if 0 <= cls < len(COCO_NAMES) else ""
+        lbl  = name.title() if name else ""
 
-        lbl = f"{name} #{tid} {conf:.0%}"
         cv2.rectangle(frame, (x1, y1), (x2, y2), c, 2)
-        cv2.putText(frame, lbl, (x1, y1-6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, c, 1, cv2.LINE_AA)
+        if lbl:
+            cv2.putText(frame, lbl, (x1, y1 - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, c, 1, cv2.LINE_AA)
 
 def draw_faces(frame, faces, labels):
     for (x1,y1,x2,y2,_), label in zip(faces, labels):
@@ -2368,15 +2370,29 @@ def draw_forbidden_zones(frame, zones: list) -> None:
 
 
 def draw_anomaly(frame, score: float):
+    """Show a clean ANOMALY banner when score exceeds the threshold.
+
+    Numeric score is intentionally omitted — operators don't act on the
+    raw value; the audit log keeps it for forensics.
+    """
     if score > CFG["anomaly_thresh"]:
-        cv2.putText(frame, f"ANOMALY {score:.2f}", (10,30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2, cv2.LINE_AA)
+        cv2.putText(frame, "ANOMALY", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
 
 def draw_hud(frame, fps: float, n_tracks: int, thermal: float):
-    ts  = time.strftime("%Y-%m-%d %H:%M:%S")
-    txt = f"{ts}  |  {fps:.1f} fps  |  {n_tracks} tracks  |  {thermal:.0f}°C"
-    cv2.putText(frame, txt, (4, frame.shape[0]-8),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180,180,180), 1, cv2.LINE_AA)
+    """Bottom-right timestamp.
+
+    fps / track count / thermal kept as parameters for caller stability,
+    but no longer rendered on-screen — they're available on the /health
+    endpoint and dashboard for anyone who wants the diagnostic numbers.
+    """
+    txt = time.strftime("%Y-%m-%d %H:%M:%S")
+    h, w = frame.shape[:2]
+    (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+    x = w - tw - 10
+    y = h - 10
+    cv2.putText(frame, txt, (x, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1, cv2.LINE_AA)
 
 
 # ─────────────────────────── MAIN LOOP ────────────────────────────────────────
