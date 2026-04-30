@@ -120,13 +120,19 @@ CFG = {
     # Auto-zoom on far person (Phase 2). Disabled with zoom_enabled=False so
     # the pipeline still works as detection-only if the camera is unreachable
     # for PTZ or cryptography is not installed.
-    "zoom_enabled":              True,
-    "zoom_in_after_far_frames":  3,     # consecutive frames with far person
-    "zoom_in_pulse_s":           0.6,
-    "zoom_in_cooldown_s":        4.0,   # seconds between zoom actions
-    "zoom_out_after_clear_s":    8.0,   # seconds clear of far before zooming out
-    "zoom_out_pulse_s":          0.6,
-    "zoom_max_pulses":           3,     # cap consecutive zoom-ins
+    #
+    # Closed-loop: keep firing zoom-in pulses until the largest detected
+    # person's bbox fills `zoom_target_bbox_ratio` of the frame height.
+    # When no far person is seen for `zoom_out_after_clear_s`, walk the
+    # zoom level back to 0 one pulse at a time.
+    "zoom_enabled":               True,
+    "zoom_in_after_far_frames":   2,     # consecutive frames before triggering
+    "zoom_in_pulse_s":            1.5,   # bigger pulse — visible movement
+    "zoom_in_cooldown_s":         2.0,   # min spacing between pulses
+    "zoom_target_bbox_ratio":     0.55,  # stop zooming when bbox fills this
+    "zoom_out_after_clear_s":     6.0,   # idle time before reverting
+    "zoom_out_pulse_s":           1.5,
+    "zoom_max_pulses":            8,     # cap (matches ~4× lens range)
 }
 
 
@@ -347,10 +353,29 @@ class _ZoomController:
             except Exception as e:
                 log.warning("zoom worker error: %s", e)
 
-    def update(self, persons: list) -> None:
-        """Call after each inference. Decides whether to enqueue a pulse."""
+    def update(self, persons: list, frame_h: int) -> None:
+        """Call after each inference. Decides whether to enqueue a pulse.
+
+        Closed-loop policy:
+          - If a FAR person is present and the largest bbox is smaller than
+            ``zoom_target_bbox_ratio * frame_h``, fire zoom-in pulses (up to
+            ``zoom_max_pulses``, throttled by the cooldown) until the
+            target ratio is reached.
+          - If no person has been FAR for ``zoom_out_after_clear_s``, walk
+            the net zoom level back to 0 one pulse per cycle.
+
+        Args:
+            persons: List of person dicts (must contain ``far`` and
+                ``bbox_h_px``).
+            frame_h: Source frame height in pixels (used as the bbox-ratio
+                denominator).
+        """
         now = time.time()
         has_far = any(p.get("far") for p in persons)
+        max_bbox_h = max(
+            (p.get("bbox_h_px", 0) for p in persons), default=0
+        )
+        target_h = self._cfg["zoom_target_bbox_ratio"] * max(frame_h, 1)
 
         if has_far:
             self._consec_far_frames += 1
@@ -362,20 +387,25 @@ class _ZoomController:
             now - self._last_action_t < self._cfg["zoom_in_cooldown_s"]
         )
 
-        # Zoom-in trigger
+        # Zoom-in: a far person exists AND we haven't framed them yet.
         if (
             has_far
             and self._consec_far_frames
                 >= self._cfg["zoom_in_after_far_frames"]
+            and max_bbox_h < target_h
             and not in_cooldown
             and self._zoom_level < self._cfg["zoom_max_pulses"]
         ):
+            log.info(
+                "zoom-in: bbox=%dpx target=%.0fpx level=%d",
+                int(max_bbox_h), target_h, self._zoom_level + 1,
+            )
             self._enqueue("zoom-in")
             self._zoom_level += 1
             self._last_action_t = now
             self._consec_far_frames = 0
 
-        # Zoom-out trigger
+        # Zoom-out: nobody far for a while; walk back to wide one pulse at a time.
         elif (
             not has_far
             and self._zoom_level > 0
@@ -383,6 +413,7 @@ class _ZoomController:
                 >= self._cfg["zoom_out_after_clear_s"]
             and not in_cooldown
         ):
+            log.info("zoom-out: level=%d", self._zoom_level - 1)
             self._enqueue("zoom-out")
             self._zoom_level -= 1
             self._last_action_t = now
@@ -560,7 +591,7 @@ def main() -> None:
                 )
 
             if zoom_ctrl is not None:
-                zoom_ctrl.update(persons)
+                zoom_ctrl.update(persons, frame_h=H_full)
 
         annotated = _annotate(frame, persons, CFG["far_threshold_m"])
         # Downscale + JPEG-encode for the MJPEG preview only. Detection still
