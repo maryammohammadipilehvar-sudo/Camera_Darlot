@@ -23,12 +23,13 @@ import http.server
 import json
 import logging
 import os
+import queue
 import socketserver
 import sys
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import cv2
 import numpy as np
@@ -115,6 +116,17 @@ CFG = {
 
     # Reconnect
     "reconnect_delay_s": 3.0,
+
+    # Auto-zoom on far person (Phase 2). Disabled with zoom_enabled=False so
+    # the pipeline still works as detection-only if the camera is unreachable
+    # for PTZ or cryptography is not installed.
+    "zoom_enabled":              True,
+    "zoom_in_after_far_frames":  3,     # consecutive frames with far person
+    "zoom_in_pulse_s":           0.6,
+    "zoom_in_cooldown_s":        4.0,   # seconds between zoom actions
+    "zoom_out_after_clear_s":    8.0,   # seconds clear of far before zooming out
+    "zoom_out_pulse_s":          0.6,
+    "zoom_max_pulses":           3,     # cap consecutive zoom-ins
 }
 
 
@@ -156,6 +168,10 @@ _state: dict = {
     "last_persons": [],
     "rtsp_open": False,
     "errors_total": 0,
+    "zoom_enabled": False,
+    "zoom_level": 0,
+    "zoom_actions_total": 0,
+    "last_zoom_action_t": 0.0,
 }
 
 
@@ -276,6 +292,112 @@ def _log_event(path: str, event: dict) -> None:
             f.write(line)
 
 
+# ─────────────────────────── ZOOM CONTROLLER ──────────────────────────────────
+
+class _ZoomController:
+    """Auto-zoom-on-far state machine + background worker.
+
+    Runs in its own daemon thread, consumes pulse requests from a bounded
+    queue, and drives PTZ via a Cam2Session. Detection thread only enqueues
+    decisions; it never blocks on HTTP.
+
+    State rules:
+      - Zoom in when ``zoom_in_after_far_frames`` consecutive inference
+        frames contain a far person, the cooldown has elapsed, and the
+        net zoom level is below ``zoom_max_pulses``.
+      - Zoom out when no far person has been seen for
+        ``zoom_out_after_clear_s`` and the net zoom level is > 0.
+    """
+
+    def __init__(self, session: "Any", cfg: dict) -> None:
+        self._session = session
+        self._cfg = cfg
+        self._queue: "queue.Queue[str]" = queue.Queue(maxsize=4)
+        self._consec_far_frames = 0
+        self._last_far_seen_t = 0.0
+        self._zoom_level = 0
+        self._last_action_t = 0.0
+        self._stop = threading.Event()
+        self._t = threading.Thread(
+            target=self._worker, name="cam2-zoom", daemon=True,
+        )
+
+    def start(self) -> None:
+        self._t.start()
+
+    def _worker(self) -> None:
+        while not self._stop.is_set():
+            try:
+                action = self._queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                if action == "zoom-in":
+                    ok = self._session.ptz_pulse(
+                        "Ptz_Cmd_ZoomAdd",
+                        duration_s=self._cfg["zoom_in_pulse_s"],
+                    )
+                    log.info("zoom-in pulse: %s", "OK" if ok else "FAIL")
+                elif action == "zoom-out":
+                    ok = self._session.ptz_pulse(
+                        "Ptz_Cmd_ZoomMinus",
+                        duration_s=self._cfg["zoom_out_pulse_s"],
+                    )
+                    log.info("zoom-out pulse: %s", "OK" if ok else "FAIL")
+            except Exception as e:
+                log.warning("zoom worker error: %s", e)
+
+    def update(self, persons: list) -> None:
+        """Call after each inference. Decides whether to enqueue a pulse."""
+        now = time.time()
+        has_far = any(p.get("far") for p in persons)
+
+        if has_far:
+            self._consec_far_frames += 1
+            self._last_far_seen_t = now
+        else:
+            self._consec_far_frames = 0
+
+        in_cooldown = (
+            now - self._last_action_t < self._cfg["zoom_in_cooldown_s"]
+        )
+
+        # Zoom-in trigger
+        if (
+            has_far
+            and self._consec_far_frames
+                >= self._cfg["zoom_in_after_far_frames"]
+            and not in_cooldown
+            and self._zoom_level < self._cfg["zoom_max_pulses"]
+        ):
+            self._enqueue("zoom-in")
+            self._zoom_level += 1
+            self._last_action_t = now
+            self._consec_far_frames = 0
+
+        # Zoom-out trigger
+        elif (
+            not has_far
+            and self._zoom_level > 0
+            and now - self._last_far_seen_t
+                >= self._cfg["zoom_out_after_clear_s"]
+            and not in_cooldown
+        ):
+            self._enqueue("zoom-out")
+            self._zoom_level -= 1
+            self._last_action_t = now
+
+        _state["zoom_level"] = self._zoom_level
+        _state["last_zoom_action_t"] = self._last_action_t
+
+    def _enqueue(self, action: str) -> None:
+        try:
+            self._queue.put_nowait(action)
+            _state["zoom_actions_total"] += 1
+        except queue.Full:
+            log.warning("zoom queue full — dropping %s", action)
+
+
 def _annotate(
     frame: np.ndarray, persons: list, far_threshold_m: float
 ) -> np.ndarray:
@@ -318,8 +440,37 @@ def _run_inference(model, frame_bgr: np.ndarray) -> list:
     return out
 
 
+def _maybe_init_zoom() -> Optional["_ZoomController"]:
+    """Build and start a zoom controller, or return None if disabled/blocked.
+
+    Failures here (cryptography missing, network down, bad creds) are logged
+    and degrade the pipeline to detection-only — they never abort startup.
+    """
+    if not CFG.get("zoom_enabled"):
+        log.info("zoom disabled in config; running detection-only")
+        return None
+    try:
+        from cam2_login import session_from_env  # heavy + optional dep
+    except Exception as e:
+        log.warning(
+            "cam2_login unavailable (%s); running detection-only", e
+        )
+        return None
+    try:
+        sess = session_from_env()
+        sess.login()
+    except Exception as e:
+        log.warning("cam2 login failed (%s); running detection-only", e)
+        return None
+    ctrl = _ZoomController(sess, CFG)
+    ctrl.start()
+    _state["zoom_enabled"] = True
+    log.info("zoom controller started")
+    return ctrl
+
+
 def main() -> None:
-    """Run the cam2 Phase-1 loop: RTSP -> YOLO -> distance -> MJPEG/health."""
+    """Run the cam2 loop: RTSP -> YOLO -> distance -> MJPEG/health (+ zoom)."""
     from ultralytics import YOLO  # heavy import; defer until run
 
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -327,6 +478,7 @@ def main() -> None:
     model = YOLO(CFG["yolo_model"], task="detect")
 
     _start_servers(CFG["mjpeg_port"], CFG["health_port"])
+    zoom_ctrl = _maybe_init_zoom()
 
     cap = open_camera(CFG["rtsp_url"])
     if not cap.isOpened():
@@ -405,6 +557,9 @@ def main() -> None:
                         "persons": far_persons,
                     },
                 )
+
+            if zoom_ctrl is not None:
+                zoom_ctrl.update(persons)
 
         annotated = _annotate(frame, persons, CFG["far_threshold_m"])
         # Downscale + JPEG-encode for the MJPEG preview only. Detection still
