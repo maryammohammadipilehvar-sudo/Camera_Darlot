@@ -101,9 +101,13 @@ CFG = {
     "far_threshold_m":         8.0,
     "min_bbox_height_px":      20,            # ignore detections below this
 
-    # Servers
+    # Servers — MJPEG re-encodes the annotated frame at this size + fps so the
+    # browser preview is fast even though inference runs on full 1440p frames.
     "mjpeg_port":      8083,                  # prod uses 8080
-    "mjpeg_quality":   70,
+    "mjpeg_w":         1280,
+    "mjpeg_h":         720,
+    "mjpeg_fps":       15,
+    "mjpeg_quality":   55,
     "health_port":     8082,                  # prod uses 8081
 
     # Observability
@@ -183,7 +187,7 @@ class _MJPEGHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(b"\r\n\r\n")
                 self.wfile.write(jpg)
                 self.wfile.write(b"\r\n")
-                time.sleep(1.0 / 25.0)
+                time.sleep(1.0 / max(CFG["mjpeg_fps"], 1))
         except (BrokenPipeError, ConnectionResetError):
             return
 
@@ -403,8 +407,20 @@ def main() -> None:
                 )
 
         annotated = _annotate(frame, persons, CFG["far_threshold_m"])
+        # Downscale + JPEG-encode for the MJPEG preview only. Detection still
+        # used the full-resolution frame above, so far-person reach isn't lost.
+        if (
+            annotated.shape[1] != CFG["mjpeg_w"]
+            or annotated.shape[0] != CFG["mjpeg_h"]
+        ):
+            preview = cv2.resize(
+                annotated, (CFG["mjpeg_w"], CFG["mjpeg_h"]),
+                interpolation=cv2.INTER_AREA,
+            )
+        else:
+            preview = annotated
         ok_enc, jpg = cv2.imencode(
-            ".jpg", annotated,
+            ".jpg", preview,
             [int(cv2.IMWRITE_JPEG_QUALITY), CFG["mjpeg_quality"]],
         )
         if ok_enc:
