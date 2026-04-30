@@ -133,6 +133,14 @@ CFG = {
     "zoom_out_after_clear_s":     6.0,   # idle time before reverting
     "zoom_out_pulse_s":           1.5,
     "zoom_max_pulses":            8,     # cap (matches ~4× lens range)
+
+    # Digital follow-zoom on the MJPEG preview. Independent of optical PTZ —
+    # works even if the lens never moves. When a FAR person is detected, the
+    # live stream crops around their bbox and upscales to mjpeg_w x mjpeg_h.
+    "follow_zoom_enabled":        True,
+    "follow_zoom_padding":        1.8,    # crop is 1.8x bbox in each dim
+    "follow_zoom_smooth_alpha":   0.25,   # 0..1, larger = snappier (less smooth)
+    "follow_zoom_min_bbox_h_px":  40,     # don't crop on tiny detections
 }
 
 
@@ -429,6 +437,99 @@ class _ZoomController:
             log.warning("zoom queue full — dropping %s", action)
 
 
+# ─────────────────────────── DIGITAL FOLLOW-ZOOM ──────────────────────────────
+
+class _FollowZoom:
+    """Crop + upscale the MJPEG preview around a far person.
+
+    Independent of optical PTZ. The detection pipeline still runs on the full
+    frame, but the live preview shows a cropped, upscaled view of the largest
+    far person — so the operator can see the face even if the lens hasn't
+    moved much.
+
+    Smoothing: target crop coords are blended with the previous crop via an
+    exponential moving average so the view doesn't jitter frame-to-frame.
+
+    Args:
+        cfg: Reference to the module ``CFG`` dict.
+        out_w: Output width (MJPEG width).
+        out_h: Output height (MJPEG height).
+    """
+
+    def __init__(self, cfg: dict, out_w: int, out_h: int) -> None:
+        self._cfg = cfg
+        self._aspect = out_w / out_h
+        self._last: Optional[tuple] = None  # (x1, y1, x2, y2) in source coords
+
+    def _target(
+        self, persons: list, fw: int, fh: int
+    ) -> Optional[tuple]:
+        """Compute the target crop rectangle for a frame (or None)."""
+        far = [
+            p for p in persons
+            if p.get("far")
+            and p.get("bbox_h_px", 0)
+                >= self._cfg["follow_zoom_min_bbox_h_px"]
+        ]
+        if not far:
+            return None
+        # Choose the farthest person (most useful to zoom on).
+        p = max(far, key=lambda p: p.get("distance_m", 0))
+        x1, y1, x2, y2 = p["bbox"]
+        cx = (x1 + x2) / 2
+        cy = (y1 + y2) / 2
+        bw = (x2 - x1) * self._cfg["follow_zoom_padding"]
+        bh = (y2 - y1) * self._cfg["follow_zoom_padding"]
+
+        # Match the MJPEG output aspect ratio so the upscale doesn't distort.
+        if bw / max(bh, 1) > self._aspect:
+            bh = bw / self._aspect
+        else:
+            bw = bh * self._aspect
+
+        # Keep crop inside frame; if too big, scale down.
+        if bw > fw:
+            bh *= fw / bw
+            bw = fw
+        if bh > fh:
+            bw *= fh / bh
+            bh = fh
+
+        cx1 = int(round(cx - bw / 2))
+        cy1 = int(round(cy - bh / 2))
+        cx2 = int(round(cx + bw / 2))
+        cy2 = int(round(cy + bh / 2))
+        # Clamp inside the frame
+        if cx1 < 0:
+            cx2 -= cx1; cx1 = 0
+        if cy1 < 0:
+            cy2 -= cy1; cy1 = 0
+        if cx2 > fw:
+            cx1 -= cx2 - fw; cx2 = fw
+        if cy2 > fh:
+            cy1 -= cy2 - fh; cy2 = fh
+        cx1 = max(0, cx1); cy1 = max(0, cy1)
+        return (cx1, cy1, cx2, cy2)
+
+    def update(
+        self, persons: list, fw: int, fh: int
+    ) -> Optional[tuple]:
+        """Return the crop rect to use this frame, or None for full frame."""
+        target = self._target(persons, fw, fh)
+        if target is None:
+            self._last = None
+            return None
+        if self._last is None:
+            self._last = target
+        else:
+            a = self._cfg["follow_zoom_smooth_alpha"]
+            self._last = tuple(
+                int(round(a * t + (1 - a) * l))
+                for t, l in zip(target, self._last)
+            )
+        return self._last
+
+
 def _annotate(
     frame: np.ndarray, persons: list, far_threshold_m: float
 ) -> np.ndarray:
@@ -511,6 +612,10 @@ def main() -> None:
 
     _start_servers(CFG["mjpeg_port"], CFG["health_port"])
     zoom_ctrl = _maybe_init_zoom()
+    follow_zoom = (
+        _FollowZoom(CFG, CFG["mjpeg_w"], CFG["mjpeg_h"])
+        if CFG.get("follow_zoom_enabled") else None
+    )
 
     cap = open_camera(CFG["rtsp_url"])
     if not cap.isOpened():
@@ -594,18 +699,31 @@ def main() -> None:
                 zoom_ctrl.update(persons, frame_h=H_full)
 
         annotated = _annotate(frame, persons, CFG["far_threshold_m"])
-        # Downscale + JPEG-encode for the MJPEG preview only. Detection still
-        # used the full-resolution frame above, so far-person reach isn't lost.
+
+        # Digital follow-zoom: when a far person is present, crop around them
+        # before scaling to the MJPEG output. Detection above already used
+        # the full frame, so this only affects what the operator sees.
+        crop_src = annotated
+        if follow_zoom is not None:
+            rect = follow_zoom.update(
+                persons, frame.shape[1], frame.shape[0]
+            )
+            if rect is not None:
+                x1, y1, x2, y2 = rect
+                if x2 > x1 and y2 > y1:
+                    crop_src = annotated[y1:y2, x1:x2]
+
+        # Downscale + JPEG-encode for the MJPEG preview only.
         if (
-            annotated.shape[1] != CFG["mjpeg_w"]
-            or annotated.shape[0] != CFG["mjpeg_h"]
+            crop_src.shape[1] != CFG["mjpeg_w"]
+            or crop_src.shape[0] != CFG["mjpeg_h"]
         ):
             preview = cv2.resize(
-                annotated, (CFG["mjpeg_w"], CFG["mjpeg_h"]),
-                interpolation=cv2.INTER_AREA,
+                crop_src, (CFG["mjpeg_w"], CFG["mjpeg_h"]),
+                interpolation=cv2.INTER_LINEAR,
             )
         else:
-            preview = annotated
+            preview = crop_src
         ok_enc, jpg = cv2.imencode(
             ".jpg", preview,
             [int(cv2.IMWRITE_JPEG_QUALITY), CFG["mjpeg_quality"]],
