@@ -135,12 +135,15 @@ CFG = {
     "zoom_max_pulses":            8,     # cap (matches ~4× lens range)
 
     # Digital follow-zoom on the MJPEG preview. Independent of optical PTZ —
-    # works even if the lens never moves. When a FAR person is detected, the
-    # live stream crops around their bbox and upscales to mjpeg_w x mjpeg_h.
+    # works even if the lens never moves. The live stream crops around the
+    # most-distant detected person and upscales to mjpeg_w x mjpeg_h.
     "follow_zoom_enabled":        True,
-    "follow_zoom_padding":        1.8,    # crop is 1.8x bbox in each dim
-    "follow_zoom_smooth_alpha":   0.25,   # 0..1, larger = snappier (less smooth)
-    "follow_zoom_min_bbox_h_px":  40,     # don't crop on tiny detections
+    "follow_zoom_far_only":       False,  # crop on any person, not just FAR
+    "follow_zoom_padding":        1.4,    # tighter framing → bigger face
+    "follow_zoom_smooth_alpha":   0.5,    # 0..1, larger = snappier
+    "follow_zoom_min_bbox_h_px":  30,     # ignore tiny detections
+    "follow_zoom_lock_s":         1.5,    # keep last crop for N seconds
+                                          # after person briefly disappears
 }
 
 
@@ -460,21 +463,22 @@ class _FollowZoom:
         self._cfg = cfg
         self._aspect = out_w / out_h
         self._last: Optional[tuple] = None  # (x1, y1, x2, y2) in source coords
+        self._last_seen_t: float = 0.0
 
     def _target(
         self, persons: list, fw: int, fh: int
     ) -> Optional[tuple]:
         """Compute the target crop rectangle for a frame (or None)."""
-        far = [
+        candidates = [
             p for p in persons
-            if p.get("far")
-            and p.get("bbox_h_px", 0)
+            if p.get("bbox_h_px", 0)
                 >= self._cfg["follow_zoom_min_bbox_h_px"]
+            and (p.get("far") or not self._cfg["follow_zoom_far_only"])
         ]
-        if not far:
+        if not candidates:
             return None
         # Choose the farthest person (most useful to zoom on).
-        p = max(far, key=lambda p: p.get("distance_m", 0))
+        p = max(candidates, key=lambda p: p.get("distance_m", 0))
         x1, y1, x2, y2 = p["bbox"]
         cx = (x1 + x2) / 2
         cy = (y1 + y2) / 2
@@ -514,12 +518,27 @@ class _FollowZoom:
     def update(
         self, persons: list, fw: int, fh: int
     ) -> Optional[tuple]:
-        """Return the crop rect to use this frame, or None for full frame."""
+        """Return the crop rect to use this frame, or None for full frame.
+
+        Holds the last crop for ``follow_zoom_lock_s`` after a person
+        disappears, so brief detection drops don't snap back to wide.
+        Snaps to target instantly on first acquisition (no smoothing-in lag).
+        """
+        now = time.time()
         target = self._target(persons, fw, fh)
         if target is None:
+            if (
+                self._last is not None
+                and now - self._last_seen_t
+                    < self._cfg["follow_zoom_lock_s"]
+            ):
+                return self._last  # hold last crop briefly
             self._last = None
             return None
+        self._last_seen_t = now
         if self._last is None:
+            # First acquisition — snap to target so the operator sees the
+            # follow-zoom kick in instantly instead of easing in.
             self._last = target
         else:
             a = self._cfg["follow_zoom_smooth_alpha"]
@@ -700,10 +719,11 @@ def main() -> None:
 
         annotated = _annotate(frame, persons, CFG["far_threshold_m"])
 
-        # Digital follow-zoom: when a far person is present, crop around them
+        # Digital follow-zoom: when a person is present, crop around them
         # before scaling to the MJPEG output. Detection above already used
         # the full frame, so this only affects what the operator sees.
         crop_src = annotated
+        following = False
         if follow_zoom is not None:
             rect = follow_zoom.update(
                 persons, frame.shape[1], frame.shape[0]
@@ -712,6 +732,7 @@ def main() -> None:
                 x1, y1, x2, y2 = rect
                 if x2 > x1 and y2 > y1:
                     crop_src = annotated[y1:y2, x1:x2]
+                    following = True
 
         # Downscale + JPEG-encode for the MJPEG preview only.
         if (
@@ -724,6 +745,12 @@ def main() -> None:
             )
         else:
             preview = crop_src
+
+        if following:
+            cv2.putText(
+                preview, "FOLLOW", (12, 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2, cv2.LINE_AA,
+            )
         ok_enc, jpg = cv2.imencode(
             ".jpg", preview,
             [int(cv2.IMWRITE_JPEG_QUALITY), CFG["mjpeg_quality"]],
