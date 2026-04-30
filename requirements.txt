@@ -28,6 +28,7 @@ paho-mqtt>=2.1.0,<3.0
 numpy>=1.24.0
 opencv-python-headless>=4.8.0
 huggingface_hub>=0.20.0
+cryptography>=42.0           # cam2 login (X25519 + AES-GCM); aarch64 wheels on PyPI
 
 # Dev / test (pure-Python, safe to install from PyPI on Jetson)
 pytest>=8.0.0
