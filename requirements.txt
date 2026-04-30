@@ -8,7 +8,9 @@ torch>=2.1.0                 # use JetPack wheel, not PyPI
 torchvision>=0.16.0          # use JetPack wheel
 
 # Tracking
-boxmot>=10.0.43
+# pinned: newer versions dropped flat ByteTrack re-export;
+#  see detect.py _init_bytetrack if upgrading
+boxmot>=10.0.43,<18.1
 
 # Face
 insightface>=0.7.3
@@ -19,9 +21,13 @@ tflite-runtime>=2.14.0       # from tensorflow-jetson wheel, see setup.sh
 sounddevice>=0.4.6
 
 # Alerting
-paho-mqtt>=1.6.1
+# Pinned to v2; code uses mqtt.CallbackAPIVersion.VERSION1 for v1 callback signatures.
+paho-mqtt>=2.1.0,<3.0
 
 # Utilities
 numpy>=1.24.0
 opencv-python-headless>=4.8.0
 huggingface_hub>=0.20.0
+
+# Dev / test (pure-Python, safe to install from PyPI on Jetson)
+pytest>=8.0.0

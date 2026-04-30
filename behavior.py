@@ -51,6 +51,9 @@ class Action:
     STANDING   = "standing"
     WALKING    = "walking"
     RUNNING    = "running"
+    SITTING    = "sitting"       # added Session 8 — was leaking as a stray
+                                  # string, breaking Markov transitions and
+                                  # overlay routing
     CROUCHING  = "crouching"
     FALLEN     = "fallen"
     RAISING    = "raising_arm"   # arms above shoulders
@@ -59,9 +62,10 @@ class Action:
 
 # Transition map used for next-action prediction (simple Markov)
 _TRANSITIONS: Dict[str, List[Tuple[str, float]]] = {
-    Action.STANDING:  [(Action.WALKING, .45), (Action.STANDING, .40), (Action.CROUCHING, .10), (Action.RUNNING, .05)],
+    Action.STANDING:  [(Action.WALKING, .40), (Action.STANDING, .35), (Action.SITTING, .10), (Action.CROUCHING, .10), (Action.RUNNING, .05)],
     Action.WALKING:   [(Action.WALKING, .50), (Action.STANDING, .25), (Action.RUNNING, .20), (Action.CROUCHING, .05)],
     Action.RUNNING:   [(Action.RUNNING, .50), (Action.WALKING, .35), (Action.STANDING, .15)],
+    Action.SITTING:   [(Action.SITTING, .65), (Action.STANDING, .30), (Action.CROUCHING, .05)],
     Action.CROUCHING: [(Action.CROUCHING, .40), (Action.STANDING, .35), (Action.WALKING, .20), (Action.FALLEN, .05)],
     Action.FALLEN:    [(Action.FALLEN, .70), (Action.CROUCHING, .20), (Action.STANDING, .10)],
     Action.RAISING:   [(Action.STANDING, .50), (Action.RAISING, .30), (Action.WALKING, .20)],
@@ -93,6 +97,11 @@ class TrackWindow:
         self.last_update = time.time()
 
     def should_alert(self, action: str, cooldown: float = 10.0) -> bool:
+        # NOTE: Duplicates the central track/zone/burst dedup in detect.py.
+        # Both are needed today because behavior.py runs in its own thread
+        # and short-circuits before emit_alert (the central dedup only runs
+        # on the telegram path). Consolidate in a future session — see
+        # FOLLOWUPS entry on duplicate dedup systems.
         now = time.time()
         if now - self.alert_ts.get(action, 0) >= cooldown:
             self.alert_ts[action] = now
@@ -107,7 +116,26 @@ class ActionClassifier:
     No neural network required — runs in <0.5ms per track on CPU.
     """
 
-    def classify(self, window: TrackWindow) -> str:
+    def classify(
+        self,
+        window: TrackWindow,
+        multi_person: bool = False,
+    ) -> str:
+        """Classify the current action for this track.
+
+        Args:
+            window: per-track rolling history of bboxes + keypoints.
+            multi_person: ``True`` when this frame contains 2+ person
+                tracks. Required for ``Action.FIGHTING`` to even be
+                considered — solo wrist movement is never fighting in
+                a real warehouse, but it's a common false positive
+                when someone sits at a desk and reaches for a mug or
+                types. The caller (``BehaviorAnalyzer._worker``) sets
+                this from ``len(person_tracks)``.
+
+        Returns:
+            One of the ``Action.*`` strings.
+        """
         if len(window.bbox_history) < 2:
             return Action.UNKNOWN
 
@@ -163,19 +191,16 @@ class ActionClassifier:
             total_h = max(h, 1)
             torso_ratio = torso_h / total_h
 
-            # Sitting: hips close to knees, torso still visible
+            # Sitting: hips close to knees (knees visually level with hips
+            # in the bbox), torso still visible, body still. The knee-hip
+            # gap is the key differentiator vs standing — standing has
+            # knees well below hips (~30-40% of bbox height); sitting
+            # collapses that. Threshold tightened from 0.22 → 0.15 to
+            # stop standing-with-incomplete-keypoints from misfiring as
+            # sitting (audit-flagged false positive).
             knee_hip_gap = abs(kne_y - hip_y) / total_h
-            if torso_ratio >= 0.18 and knee_hip_gap < 0.22 and speed < 0.08:
-                return "sitting"
-
-            # Sitting: auto rule
-
-            knee_hip_gap = abs(kne_y - hip_y) / total_h
-
-            if 0.16 <= torso_ratio <= 0.60 and knee_hip_gap < 0.42 and speed < 0.14:
-
-                return "sitting"
-
+            if torso_ratio >= 0.18 and knee_hip_gap < 0.15 and speed < 0.08:
+                return Action.SITTING
 
             # Crouching: torso compressed and knees near hip level
             if torso_ratio < 0.25 and abs(kne_y - hip_y) < 0.15 * total_h:
@@ -187,18 +212,53 @@ class ActionClassifier:
             if arm_raised and speed < 0.08:
                 return Action.RAISING
 
-            # Fighting: large wrist velocity
-            wrist_speeds = []
-            for i in range(1, min(len(kps), 5)):
-                prev = kps[-(i+1)]
-                if prev is not None and prev.shape[0] >= 17:
-                    dlw = np.linalg.norm(kps[-i][KP_L_WRIST][:2] - prev[KP_L_WRIST][:2]) / max(h, 1) \
-                          if kps[-i] is not None else 0
-                    drw = np.linalg.norm(kps[-i][KP_R_WRIST][:2] - prev[KP_R_WRIST][:2]) / max(h, 1) \
-                          if kps[-i] is not None else 0
-                    wrist_speeds.append(max(dlw, drw))
-            if wrist_speeds and max(wrist_speeds) > 0.25:
-                return Action.FIGHTING
+            # Fighting: five gates required to fire — single-person wrist
+            # motion at a desk used to false-fire as fighting (Session 9
+            # operator report). Real fights have ALL of:
+            #   1. ≥2 person tracks present in the frame.
+            #   2. Both wrists tracked with confidence > 0.5 right now
+            #      (low confidence → unreliable wrist position → fake
+            #      "velocity" from frame-to-frame jitter).
+            #   3. BOTH wrists moving fast — typing has one wrist on the
+            #      mouse and one resting; fighting throws both arms.
+            #   4. Body itself moving (bbox center > 0.05). Two people
+            #      sitting calmly at adjacent desks shouldn't fire even
+            #      if their hands are moving.
+            #   5. Wrist speed sustained, not a single noisy frame.
+            cur_kp = kps[-1] if kps else None
+            both_wrists_confident = (
+                multi_person
+                and cur_kp is not None
+                and cur_kp.shape[0] >= 17
+                and float(cur_kp[KP_L_WRIST][2]) > 0.5
+                and float(cur_kp[KP_R_WRIST][2]) > 0.5
+            )
+            if both_wrists_confident:
+                l_speeds, r_speeds = [], []
+                for i in range(1, min(len(kps), 5)):
+                    prev = kps[-(i + 1)]
+                    cur  = kps[-i]
+                    if (prev is None or cur is None
+                            or prev.shape[0] < 17 or cur.shape[0] < 17):
+                        continue
+                    if (float(prev[KP_L_WRIST][2]) < 0.4
+                            or float(prev[KP_R_WRIST][2]) < 0.4
+                            or float(cur[KP_L_WRIST][2]) < 0.4
+                            or float(cur[KP_R_WRIST][2]) < 0.4):
+                        continue
+                    dl = np.linalg.norm(
+                        cur[KP_L_WRIST][:2] - prev[KP_L_WRIST][:2]
+                    ) / max(h, 1)
+                    dr = np.linalg.norm(
+                        cur[KP_R_WRIST][:2] - prev[KP_R_WRIST][:2]
+                    ) / max(h, 1)
+                    l_speeds.append(float(dl))
+                    r_speeds.append(float(dr))
+                if (l_speeds and r_speeds
+                        and max(l_speeds) > 0.35
+                        and max(r_speeds) > 0.35
+                        and speed > 0.05):
+                    return Action.FIGHTING
 
         # ── 5. Speed thresholds ────────────────────────────────────────────────
         if speed > 0.20:
@@ -338,6 +398,11 @@ class BehaviorAnalyzer:
             # Match pose results to ByteTrack tracks by IoU
             pose_by_track = self._match_pose_to_tracks(person_tracks, pose_results, frame.shape)
 
+            # Multi-person flag for the classifier — fighting is gated on
+            # ≥2 person tracks present (single person waving hands at a
+            # desk is not fighting; this used to be a major false positive).
+            multi_person = len(person_tracks) >= 2
+
             new_labels: Dict[int, dict] = {}
 
             for t in person_tracks:
@@ -352,7 +417,7 @@ class BehaviorAnalyzer:
                 kps = pose_by_track.get(track_id)
                 w.push(kps, (x1,y1,x2,y2))
 
-                action      = self._classifier.classify(w)
+                action      = self._classifier.classify(w, multi_person=multi_person)
                 next_action = predict_next(action)
                 w.action      = action
                 w.next_action = next_action
@@ -364,27 +429,28 @@ class BehaviorAnalyzer:
                 }
 
                 # ── Alert logic ────────────────────────────────────────────────
+                # Severity is now set centrally by compute_severity in
+                # detect.py from the severity_table — do not pass a
+                # `severity` hint in detail (that would trip the dashboard
+                # severityOf upgrade-magic; see FOLLOWUPS entry).
                 if self._emit_fn:
-                    if action == Action.FALLEN and w.should_alert(Action.FALLEN, 15.0):
+                    if action == Action.FALLEN and w.should_alert(Action.FALLEN, 60.0):
                         self._emit_fn(self._camera_id, "behavior", {
                             "action":   "fallen",
                             "track_id": track_id,
                             "label":    f"Person #{track_id} may have fallen",
-                            "severity": "high",
                         })
-                    elif action == Action.FIGHTING and w.should_alert(Action.FIGHTING, 10.0):
+                    elif action == Action.FIGHTING and w.should_alert(Action.FIGHTING, 60.0):
                         self._emit_fn(self._camera_id, "behavior", {
                             "action":   "fighting",
                             "track_id": track_id,
                             "label":    f"Aggressive movement #{track_id}",
-                            "severity": "high",
                         })
-                    elif action == Action.RUNNING and w.should_alert(Action.RUNNING, 20.0):
+                    elif action == Action.RUNNING and w.should_alert(Action.RUNNING, 120.0):
                         self._emit_fn(self._camera_id, "behavior", {
                             "action":   "running",
                             "track_id": track_id,
                             "label":    f"Person #{track_id} running",
-                            "severity": "medium",
                         })
 
             with self._lock:
@@ -455,6 +521,7 @@ ACTION_COLORS = {
     Action.STANDING:  (0,   220,  80),
     Action.WALKING:   (0,   180, 255),
     Action.RUNNING:   (0,   100, 255),
+    Action.SITTING:   (140, 200, 140),
     Action.CROUCHING: (60,  200, 255),
     Action.FALLEN:    (0,     0, 255),
     Action.RAISING:   (255, 180,   0),
@@ -462,8 +529,27 @@ ACTION_COLORS = {
     Action.UNKNOWN:   (120, 120, 120),
 }
 
+# Actions considered routine — no overlay drawn so the annotated frame
+# stays uncluttered. Anything else gets a Title-Case word in ACTION_COLORS.
+# SITTING is routine in a warehouse context (operators at desks) — no overlay.
+_ROUTINE_ACTIONS = {Action.STANDING, Action.WALKING, Action.SITTING, Action.UNKNOWN}
+
+_ACTION_DISPLAY = {
+    Action.RUNNING:   "Running",
+    Action.FALLEN:    "Falling",
+    Action.CROUCHING: "Crouching",
+    Action.RAISING:   "Hands raised",
+    Action.FIGHTING:  "Fighting",
+}
+
+
 def draw_behavior(frame: np.ndarray, tracks: np.ndarray, labels: Dict[int, dict]):
-    """Overlay action labels on annotated frame."""
+    """Overlay action labels for non-routine behavior only.
+
+    Routine actions (standing / walking / unknown) get NO overlay so the
+    annotated frame stays readable. Non-routine actions render with the
+    ACTION_COLORS-driven color and a Title-Case word.
+    """
     if not labels or tracks is None or len(tracks) == 0:
         return
     for t in tracks:
@@ -473,11 +559,11 @@ def draw_behavior(frame: np.ndarray, tracks: np.ndarray, labels: Dict[int, dict]
         info = labels.get(tid)
         if not info:
             continue
+        action = info.get("action")
+        if not action or action in _ROUTINE_ACTIONS:
+            continue
         x1, y2 = int(t[0]), int(t[3])
-        action = info.get("action", "?")
-        nxt    = info.get("next_action", "?")
-        color  = ACTION_COLORS.get(action, (200, 200, 200))
-
-        label = str(label).split("???")[0].strip() if label else "unknown"
-        cv2.putText(frame, label, (x1, y2+15),
+        color = ACTION_COLORS.get(action, (200, 200, 200))
+        text  = _ACTION_DISPLAY.get(action, str(action).title())
+        cv2.putText(frame, text, (x1, y2+15),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)

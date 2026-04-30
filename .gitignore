@@ -4,7 +4,39 @@ __pycache__/
 *.pyo
 *.bak
 *.db
+*.db-shm
+*.db-wal
+# Forensic snapshots from DB recovery (e.g. sentinel_events.db.broken_<ts>,
+# sentinel_events.db-wal.broken_<ts>). Pattern catches any file with
+# .broken_ in its name.
+*.broken_*
 backups/
 upgrade/
 *.pt
 *.onnx
+*.engine
+*.log
+_old_backups/
+*.bak
+*.bak_*
+*.before_*
+*.auto_fix_*
+
+# Credential files — must NEVER be tracked
+*.env
+.env.*
+*token*.txt
+*credential*
+*secret*
+.config/
+
+# Test corpus — operator-recorded MP4s, large, machine-specific.
+# Schema (filenames + scenarios) lives in tests/corpus/README.md.
+tests/corpus/*.mp4
+tests/corpus/*.avi
+tests/corpus/*.mkv
+tests/corpus/*.webm
+
+# Pytest
+.pytest_cache/
+.coverage

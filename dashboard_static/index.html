@@ -189,7 +189,34 @@ body::after{content:'';position:fixed;inset:0;
 
 .stream-wrap{position:relative;flex:1;min-height:0;background:#000;overflow:hidden}
 
-#stream-img{width:100%;height:100%;object-fit:cover;opacity:0;
+/* ── Forbidden-zone canvas overlay ─────────────────────────────────────── */
+#zone-canvas{position:absolute;inset:0;pointer-events:none}
+#zone-canvas.drawing{pointer-events:auto;cursor:crosshair}
+.zone-toolbar{position:absolute;top:10px;left:10px;display:flex;gap:6px;
+  z-index:5;font-family:var(--font-ui)}
+.zone-toolbar button{font-size:11px;font-weight:600;letter-spacing:1px;
+  padding:6px 12px;border-radius:var(--r);cursor:pointer;border:1px solid;
+  background:rgba(0,0,0,.55);color:var(--text);border-color:var(--border2);
+  transition:background .15s, color .15s, border-color .15s}
+.zone-toolbar button:hover{background:rgba(0,0,0,.78);color:var(--accent);
+  border-color:var(--accent)}
+.zone-toolbar button.active{background:var(--accent);color:#04110a;
+  border-color:var(--accent)}
+.zone-popup{position:absolute;background:var(--bg2);border:1px solid var(--border2);
+  border-radius:var(--r);padding:8px 12px;box-shadow:0 4px 16px rgba(0,0,0,.5);
+  z-index:6;font-family:var(--font-ui);font-size:11px;color:var(--text);
+  min-width:140px}
+.zone-popup-name{font-weight:600;margin-bottom:6px;color:var(--text)}
+.zone-popup button{font-size:10px;padding:4px 10px;border-radius:var(--r);
+  cursor:pointer;border:1px solid var(--red);background:transparent;
+  color:var(--red);letter-spacing:1px;font-weight:600}
+.zone-popup button:hover{background:var(--red);color:#fff}
+.zone-hint{position:absolute;bottom:10px;left:10px;font-family:var(--font-mono);
+  font-size:10px;color:var(--text2);background:rgba(0,0,0,.65);padding:5px 10px;
+  border-radius:var(--r);letter-spacing:.5px;z-index:5}
+.zone-hint.hidden{display:none}
+
+#stream-img{width:100%;height:100%;object-fit:contain;opacity:0;
   transition:opacity .6s;display:block}
 
 .stream-hud{position:absolute;inset:0;display:flex;flex-direction:column;
@@ -241,6 +268,9 @@ body::after{content:'';position:fixed;inset:0;
   transition:border-color .2s,background .2s;
   animation:slideIn .22s cubic-bezier(.2,.8,.4,1)}
 .ev-card:hover{border-color:var(--border2);background:var(--bg4)}
+/* CRITICAL events (forbidden_zone, fire-class audio, etc.) — red card. */
+.ev-card.sev-crit{background:var(--red-d);border-color:var(--red)}
+.ev-card.sev-crit:hover{background:rgba(255,77,77,.22);border-color:var(--red)}
 @keyframes slideIn{from{opacity:0;transform:translateX(10px)}to{opacity:1;transform:none}}
 
 .ev-bar{width:3px;flex-shrink:0}
@@ -321,20 +351,96 @@ td.trunc{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
 /* ─── Modal ───────────────────────────────────────────────────────────────── */
 #modal{position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:2000;
-  display:flex;align-items:center;justify-content:center;
+  display:flex;align-items:center;justify-content:center;padding:20px;
   backdrop-filter:blur(5px);-webkit-backdrop-filter:blur(5px)}
 #modal.hidden{display:none}
-.modal-box{background:var(--bg2);border:1px solid var(--border2);
-  border-radius:6px;padding:22px;max-width:520px;width:92%;
-  max-height:72vh;overflow-y:auto;position:relative}
-#modal-close{position:absolute;top:11px;right:12px;background:none;
-  border:none;color:var(--text3);cursor:pointer;font-size:16px;
-  transition:color .2s;padding:2px 6px}
-#modal-close:hover{color:var(--text)}
-.modal-ts{font-family:var(--font-mono);font-size:10px;color:var(--text3);
-  margin-bottom:10px}
-#modal-pre{font-family:var(--font-mono);font-size:12px;color:var(--teal);
-  white-space:pre;line-height:1.65;word-break:break-all}
+
+.modal-box{background:var(--bg2);border:1px solid var(--border2);border-radius:6px;
+  width:100%;max-width:640px;max-height:86vh;display:flex;flex-direction:column;
+  overflow:hidden;position:relative;box-shadow:0 14px 40px rgba(0,0,0,.55)}
+
+.modal-sev-strip{height:4px;width:100%;background:var(--text3);flex-shrink:0;
+  transition:background .2s}
+
+.modal-head{display:flex;align-items:center;gap:10px;padding:14px 50px 10px 22px;
+  flex-shrink:0}
+.modal-sev-pill{display:inline-block;padding:2px 9px;border-radius:2px;
+  font-size:10px;font-weight:700;letter-spacing:1.5px;border:1px solid currentColor;
+  font-family:var(--font-ui)}
+.modal-eyebrow{font-family:var(--font-mono);font-size:10px;letter-spacing:1.5px;
+  color:var(--text3);text-transform:uppercase}
+
+.modal-close{position:absolute;top:14px;right:14px;background:none;border:none;
+  color:var(--text3);cursor:pointer;font-size:16px;padding:4px 8px;border-radius:var(--r);
+  transition:color .2s,background .15s,box-shadow .15s}
+.modal-close:hover{color:var(--text);background:rgba(255,255,255,.04)}
+.modal-close:focus-visible{outline:none;box-shadow:0 0 0 2px var(--accent);color:var(--text)}
+
+.modal-headline{font-family:var(--font-ui);font-size:20px;font-weight:600;
+  color:var(--text);line-height:1.25;padding:0 22px;flex-shrink:0}
+.modal-sub{font-family:var(--font-mono);font-size:11px;color:var(--text2);
+  padding:4px 22px 16px;flex-shrink:0}
+
+.modal-scroll{overflow-y:auto;padding:0 22px 4px;flex:1;min-height:0;
+  scrollbar-width:thin;scrollbar-color:var(--border2) transparent}
+.modal-scroll::-webkit-scrollbar{width:4px}
+.modal-scroll::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px}
+
+.mfact{background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);
+  padding:8px 10px;min-width:0}
+.mfact-l{font-size:9px;letter-spacing:1.5px;color:var(--text3);font-weight:600;
+  text-transform:uppercase;margin-bottom:3px}
+.mfact-v{font-size:13px;font-weight:500;color:var(--text);overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.mfact-empty{grid-column:1/-1;color:var(--text3);font-size:11px;font-style:italic;
+  padding:6px 2px}
+
+.modal-human{margin:0 0 16px;padding:0;display:grid;
+  grid-template-columns:max-content 1fr;column-gap:14px;row-gap:6px}
+.modal-human dt{font-size:11px;letter-spacing:1.2px;color:var(--text3);
+  font-weight:500;text-transform:uppercase;margin:0}
+.modal-human dd{font-size:13px;color:var(--text);margin:0;
+  overflow-wrap:anywhere}
+
+.modal-evidence{background:var(--bg);border:1px solid var(--border);border-radius:6px;
+  aspect-ratio:16/9;display:flex;align-items:center;justify-content:center;
+  margin-bottom:16px;flex-shrink:0}
+.modal-evidence-txt{color:var(--text3);font-size:11px;letter-spacing:1.5px;
+  text-transform:uppercase}
+
+.modal-dev{margin-bottom:14px;border:1px solid var(--border);border-radius:var(--r);
+  background:var(--bg3)}
+.modal-dev summary{cursor:pointer;padding:7px 12px;font-size:11px;font-weight:500;
+  color:var(--text2);letter-spacing:.5px;list-style:none;user-select:none;
+  transition:color .2s}
+.modal-dev summary::-webkit-details-marker{display:none}
+.modal-dev summary::before{content:'▸';display:inline-block;margin-right:7px;
+  transition:transform .2s;color:var(--text3)}
+.modal-dev[open] summary::before{transform:rotate(90deg)}
+.modal-dev summary:hover{color:var(--text)}
+.modal-dev summary:focus-visible{outline:none;box-shadow:0 0 0 2px var(--accent) inset}
+.modal-copy-btn{margin:0 12px 8px}
+.modal-dev-json{font-family:var(--font-mono);font-size:11px;color:var(--teal);
+  padding:0 12px 12px;white-space:pre-wrap;word-break:break-all;line-height:1.6;
+  margin:0}
+
+.modal-footer{border-top:1px solid var(--border);padding:10px 22px 14px;flex-shrink:0;
+  background:var(--bg2)}
+.modal-kbd{font-family:var(--font-mono);font-size:9px;letter-spacing:1px;
+  color:var(--text3);text-align:center;margin-bottom:8px}
+.modal-actions{display:flex;justify-content:flex-end;gap:8px}
+
+.btn-ack,.btn-escalate{font-family:var(--font-ui);font-size:12px;font-weight:600;
+  letter-spacing:1px;padding:8px 18px;border-radius:var(--r);cursor:pointer;
+  border:1px solid currentColor;transition:background .15s,box-shadow .15s,transform .08s}
+.btn-ack{background:var(--accent);color:#04110a;border-color:var(--accent)}
+.btn-ack:hover{background:var(--accent-2);box-shadow:0 0 12px var(--accent-glow)}
+.btn-ack:active{transform:translateY(1px)}
+.btn-ack:focus-visible{outline:none;box-shadow:0 0 0 2px var(--text) inset}
+.btn-escalate{background:transparent;color:var(--yellow);border-color:var(--yellow)}
+.btn-escalate:hover{background:var(--yellow-d)}
+.btn-escalate:active{transform:translateY(1px)}
+.btn-escalate:focus-visible{outline:none;box-shadow:0 0 0 2px var(--yellow) inset}
 </style>
 </head>
 <body>
@@ -343,11 +449,36 @@ td.trunc{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 <div id="toasts"></div>
 
 <!-- Detail modal -->
-<div id="modal" class="hidden">
+<div id="modal" class="hidden" role="dialog" aria-modal="true" aria-labelledby="modal-headline">
   <div class="modal-box">
-    <button id="modal-close" title="Close">✕</button>
-    <div class="modal-ts" id="modal-ts"></div>
-    <pre id="modal-pre"></pre>
+    <div class="modal-sev-strip" id="modal-sev-strip"></div>
+    <div class="modal-head">
+      <span class="modal-sev-pill" id="modal-sev-pill">—</span>
+      <span class="modal-eyebrow" id="modal-eyebrow"></span>
+      <button id="modal-close" class="modal-close" aria-label="Close" onclick="closeModal()">✕</button>
+    </div>
+    <div class="modal-headline" id="modal-headline"></div>
+    <div class="modal-sub" id="modal-sub"></div>
+    <div class="modal-scroll">
+      <div class="modal-evidence">
+        <img id="modal-evidence-img" class="modal-evidence-img"
+             alt="Event snapshot" style="display:none; max-width:100%; border-radius:4px">
+        <div class="modal-evidence-txt" id="modal-evidence-txt">No snapshot captured</div>
+      </div>
+      <dl class="modal-human" id="modal-human"></dl>
+      <details class="modal-dev">
+        <summary>Technical details</summary>
+        <button class="sb modal-copy-btn" onclick="modalCopyJson()">Copy JSON</button>
+        <pre class="modal-dev-json" id="modal-dev-json"></pre>
+      </details>
+    </div>
+    <div class="modal-footer">
+      <div class="modal-kbd">Enter · Acknowledge     Shift+E · Escalate     Esc · Close</div>
+      <div class="modal-actions">
+        <button id="btn-escalate" class="btn-escalate" onclick="modalEscalate()">⚑ Escalate</button>
+        <button id="btn-ack" class="btn-ack" onclick="modalAck()">✓ Acknowledge</button>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -394,6 +525,13 @@ td.trunc{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
       <div class="stream-wrap">
         <img id="stream-img" alt="Live feed" />
+        <canvas id="zone-canvas"></canvas>
+        <div class="zone-toolbar">
+          <button id="zone-draw-btn" type="button" onclick="zoneToggleDraw()">Draw zone</button>
+        </div>
+        <div id="zone-hint" class="zone-hint hidden">
+          Click to add point · Double-click to close · Backspace to undo · Esc to cancel
+        </div>
         <div class="stream-hud" id="stream-hud">
           <div class="spinner"></div>
           <span id="stream-hud-txt">Connecting to stream…</span>
@@ -526,7 +664,15 @@ function fmtUp(s){
   return h+'h '+String(m).padStart(2,'0')+'m';
 }
 function summary(ev){
-  if(ev.display_summary) return ev.display_summary;
+  // Trust the server-rendered display_summary except when it's the
+  // literal "Unknown event" placeholder — that means the server didn't
+  // recognise the kind (legacy events from before format_event_for_ui
+  // learned this kind, or an old dashboard service that hasn't picked
+  // up the latest code). Fall through to the JS kind-branch logic so we
+  // still produce a useful title.
+  if(ev.display_summary && ev.display_summary !== 'Unknown event'){
+    return ev.display_summary;
+  }
   const det = typeof ev.detail==='string' ? tryParse(ev.detail) : ev.detail;
   if(!det) return '';
   if(ev.kind==='detection_summary' && det.label) return det.label;
@@ -539,6 +685,16 @@ function summary(ev){
   if(ev.kind==='loitering') return det.zone ? `Loitering detected in ${det.zone}` : 'Loitering detected';
   if(ev.kind==='audio') return det.class ? `Audio alert: ${det.class}` : 'Audio alert';
   if(ev.kind==='anomaly') return 'Anomaly detected';
+  if(ev.kind==='behavior') return det.label || `Behavior: ${det.action || 'unknown'}`;
+  if(ev.kind==='forbidden_zone'){
+    const zone = det.zone || det.zone_name || 'zone';
+    return `Intrusion: ${zone}`;
+  }
+  if(ev.kind==='phone_use'){
+    const tid = det.track_id;
+    if(typeof tid === 'number' && tid >= 0) return `Phone use — Person #${tid}`;
+    return 'Phone use detected';
+  }
   return ev.kind || 'event';
 }
 function pill(id,ok){
@@ -672,8 +828,14 @@ function renderFeed(){
     const s=summary(ev);
     const t=ev.display_short_time || rel(ev.ts);
     const cam=ev.display_camera || ev.camera || '';
-    return `<div class="ev-card" onclick='openModal(${esc(ev)})'>
-      <div class="ev-bar" style="background:${m.c}"></div>
+    // Severity drives the card colour (left bar + critical-card highlight)
+    // so a forbidden-zone breach reads as RED at a glance. The kind badge
+    // still shows the category in the top-row pill.
+    const sev = severityOf(ev);
+    const sevMeta = SEVERITY_META[sev] || SEVERITY_META.info;
+    const sevCls = sev === 'critical' ? ' sev-crit' : '';
+    return `<div class="ev-card${sevCls}" onclick='openModal(${esc(ev)})'>
+      <div class="ev-bar" style="background:${sevMeta.color}"></div>
       <div class="ev-body">
         <div class="ev-top">
           <span class="badge ${m.cls}">${m.lbl}</span>
@@ -777,18 +939,306 @@ function showToast(ev){
 }
 
 // ── Modal ─────────────────────────────────────────────────────────────────────
+// Audio classes that render as CRITICAL severity regardless of numeric score.
+// All other audio classes are downgraded to HIGH. Tune this list to match the
+// real-world false-positive profile — a quieter environment may warrant
+// removing 'alarm' or 'siren' if nearby traffic triggers them frequently.
+const CRITICAL_AUDIO_CLASSES = ['gunshot','scream','glass','alarm','siren'];
+
+const SEVERITY_META = {
+  critical: {label:'CRITICAL', color:'var(--red)',    bg:'var(--red-d)'},
+  high:     {label:'HIGH',     color:'var(--yellow)', bg:'var(--yellow-d)'},
+  medium:   {label:'MEDIUM',   color:'var(--blue)',   bg:'var(--blue-d)'},
+  low:      {label:'LOW',      color:'var(--teal)',   bg:'var(--teal-d)'},
+  info:     {label:'INFO',     color:'var(--text3)',  bg:'transparent'},
+};
+
 function esc(ev){
   return JSON.stringify(JSON.stringify(ev));  // double-encode for onclick attr
 }
+
+// Map event → severity key.
+//
+// Order of precedence:
+//   1. Mode-invariant kinds — kind alone is authoritative regardless of
+//      what detail.severity says. Protects against legacy rows where
+//      detail.severity carries a stale operator hint (default "low") not
+//      the computed truth. Backend stamps the computed value going
+//      forward; this layer makes the dashboard right for old data too.
+//   2. detail.severity if recognisable — backend stamps it with the
+//      computed value (commit 265f44b).
+//   3. Kind-based fallback — defensive for legacy / future kinds.
+function severityOf(ev){
+  const det = ev.detail || {};
+  const kind = ev.kind || ev.display_kind || '';
+
+  // (1) Mode-invariant kinds: severity is fixed in the backend table.
+  if(kind === 'forbidden_zone') return 'critical';
+
+  // (2) Trust the stamped severity for everything else.
+  const raw = String(det.severity || '').toLowerCase();
+  if(raw === 'critical' || raw === 'high' || raw === 'medium' ||
+     raw === 'low' || raw === 'info') return raw;
+
+  // (3) Fallback for legacy events where detail.severity is missing.
+  if(kind === 'anomaly' || kind === 'thermal') return 'high';
+  if(kind === 'audio'){
+    const c = String(det.class || '').toLowerCase();
+    return CRITICAL_AUDIO_CLASSES.some(x => c.includes(x)) ? 'critical' : 'low';
+  }
+  if(kind === 'loitering') return 'high';
+  if(kind === 'phone_use') return 'low';
+  if(kind === 'detection') return 'medium';
+  if(kind === 'detection_summary' || kind === 'face_match' ||
+     kind === 'behavior') return 'low';
+  return 'info';
+}
+
+// Title-case a snake/space string (e.g. "knife_object" → "Knife Object").
+function _titleCase(s){
+  return String(s).replace(/_/g,' ').replace(/\b\w/g, c => c.toUpperCase());
+}
+
+// Backend kind → human-readable label. Translation lives client-side
+// because the backend stays kind-agnostic; format_event_for_ui only
+// builds display_summary, not the operator-facing event-type word.
+const KIND_HUMAN = {
+  detection:         'Person detection',
+  detection_summary: 'Activity summary',
+  behavior:          'Behavior',
+  face_match:        'Face match',
+  audio:             'Audio event',
+  thermal:           'Thermal anomaly',
+  anomaly:           'Visual anomaly',
+  burst_summary:     'Multiple events',
+  forbidden_zone:    'Forbidden zone',
+  phone_use:         'Phone use',
+};
+
+// Format an event ts (seconds since epoch) for the modal facts list.
+// Longer than fmtTs so the modal reads as prose, e.g. "27 Apr 2026, 14:12:36".
+function fmtTsHuman(ts){
+  const d = new Date(Number(ts) * 1000);
+  if(isNaN(d.getTime())) return '—';
+  try {
+    return d.toLocaleDateString('en-GB',
+      {year:'numeric', month:'short', day:'numeric'}) +
+      ', ' +
+      d.toLocaleTimeString('en-GB', {hour12:false});
+  } catch(_) {
+    return fmtTs(ts);
+  }
+}
+
+// Translate kind → human label, refining with subtype when present.
+function kindHuman(ev){
+  const det = ev.detail || {};
+  const base = KIND_HUMAN[ev.kind] || _titleCase(ev.kind || 'event');
+  if(ev.kind === 'behavior' && det.action){
+    return `${base} — ${String(det.action)}`;
+  }
+  if(ev.kind === 'audio' && det.class){
+    return `${base} — ${String(det.class)}`;
+  }
+  return base;
+}
+
+// Build operator-friendly facts list for the modal.
+// Pure: returns [{label, value}] in display order. Severity intentionally
+// omitted — the badge above already shows it, and a duplicate row would
+// expose the existing severityOf() upgrade vs detail.severity disagreement.
+// Confidence / Track / Zone show conditionally; Zone hides "main" since
+// it's a placeholder until polygons land.
+function buildHumanFacts(ev){
+  const det = ev.detail || {};
+  const facts = [];
+  facts.push({label:'Camera', value: ev.display_camera || ev.camera || '—'});
+  facts.push({label:'Time',   value: fmtTsHuman(ev.ts)});
+  facts.push({label:'Type',   value: kindHuman(ev)});
+  if(det.confidence != null && !isNaN(Number(det.confidence))){
+    facts.push({label:'Confidence',
+                value: Math.round(Number(det.confidence) * 100) + '%'});
+  }
+  if(det.track_id != null){
+    const tid = Number(det.track_id);
+    if(Number.isInteger(tid) && tid >= 0){
+      facts.push({label:'Track', value:'#' + tid});
+    }
+  }
+  if(det.zone && String(det.zone) !== 'main'){
+    facts.push({label:'Zone', value:String(det.zone)});
+  }
+  return facts;
+}
+
+// Build fact cells for the home-grid card layout. The event modal uses
+// buildHumanFacts instead — operator-friendly labels, no kind-specific
+// quirks. Max 6 cells; null/undefined values skipped.
+function buildFacts(ev){
+  const det = ev.detail || {};
+  const kind = ev.kind || '';
+  const facts = [];
+
+  if(kind === 'detection_summary'){
+    if(det.count != null) facts.push({label:'COUNT', value:String(det.count)});
+    if(det.classes && typeof det.classes === 'object'){
+      const top = Object.entries(det.classes)
+        .sort((a,b) => Number(b[1]) - Number(a[1]))
+        .slice(0,3)
+        .map(([k,v]) => `${v}×${_titleCase(k)}`)
+        .join(', ');
+      if(top) facts.push({label:'TOP CLASSES', value:top});
+    } else if(det.label){
+      facts.push({label:'SUMMARY', value:String(det.label)});
+    }
+    return facts;
+  }
+
+  if(det.class_name) facts.push({label:'WHAT', value:_titleCase(det.class_name)});
+  if(det.confidence != null) facts.push({label:'CONFIDENCE', value:Math.round(Number(det.confidence)*100)+'%'});
+  if(det.track_id != null) facts.push({label:'TRACK', value:'#'+det.track_id});
+  if(det.zone) facts.push({label:'ZONE', value:String(det.zone)});
+  if(det.dwell_s != null) facts.push({label:'DWELL', value:Math.round(Number(det.dwell_s))+'s'});
+  if(det.class && kind === 'audio') facts.push({label:'SOUND', value:_titleCase(det.class)});
+  if(det.score != null) facts.push({label:'SCORE', value:Number(det.score).toFixed(2)});
+  if(det.temp_c != null) facts.push({label:'TEMP', value:Number(det.temp_c).toFixed(1)+'°C'});
+
+  return facts.slice(0, 6);
+}
+
+// Element previously focused before modal opened — restored on close (a11y).
+let _modalPrevFocus = null;
+// Currently-displayed event, used by action handlers.
+let _modalCurrentEv = null;
+
+// Small inline toast helper — action feedback only. Distinct from showToast(),
+// which is tailored to live event cards. Uses the existing .toast CSS.
+function _modalToast(msg, color){
+  const t = document.createElement('div');
+  t.className = 'toast';
+  t.innerHTML =
+    `<div class="t-bar" style="background:${color}"></div>` +
+    `<div class="t-body"><div class="t-det">${msg}</div></div>`;
+  const host = document.getElementById('toasts');
+  if(!host) return;
+  host.appendChild(t);
+  requestAnimationFrame(()=>requestAnimationFrame(()=>t.classList.add('show')));
+  setTimeout(()=>{t.classList.remove('show'); setTimeout(()=>t.remove(), 400);}, 3200);
+}
+
+// HTML-escape for text that will be injected via innerHTML. The fact-grid
+// values come from backend JSON, not user input, but defence-in-depth is cheap.
+function _htmlEsc(s){
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[c]));
+}
+
 function openModal(evStr){
-  const ev=typeof evStr==='string'?JSON.parse(evStr):evStr;
-  let det=ev.detail;
-  if(typeof det==='string')det=tryParse(det);
-  const obj={...ev,detail:det};
-  document.getElementById('modal-ts').textContent=
-    'Event #'+ev.id+' — '+fmtTs(ev.ts);
-  document.getElementById('modal-pre').textContent=JSON.stringify(obj,null,2);
-  document.getElementById('modal').classList.remove('hidden');
+  const ev = typeof evStr === 'string' ? JSON.parse(evStr) : evStr;
+  let det = ev.detail;
+  if(typeof det === 'string') det = tryParse(det);
+  const obj = {...ev, detail:det};
+  _modalCurrentEv = obj;
+
+  const sev = severityOf(obj);
+  const meta = SEVERITY_META[sev] || SEVERITY_META.info;
+
+  const humanFacts = buildHumanFacts(obj);
+  const humanHtml = humanFacts.map(f =>
+    `<dt>${_htmlEsc(f.label)}</dt>` +
+    `<dd title="${_htmlEsc(f.value)}">${_htmlEsc(f.value)}</dd>`
+  ).join('');
+
+  const cam = obj.display_camera || obj.camera || '—';
+  const timeTxt = obj.display_time || fmtTs(obj.ts);
+  const headline = obj.display_summary || summary(obj) || (obj.kind || 'Event');
+
+  document.getElementById('modal-sev-strip').style.background = meta.color;
+  const pill = document.getElementById('modal-sev-pill');
+  pill.textContent = meta.label;
+  pill.style.color = meta.color;
+  pill.style.borderColor = meta.color;
+  pill.style.background = meta.bg;
+  document.getElementById('modal-eyebrow').textContent =
+    'Event · #' + (obj.id != null ? obj.id : '?');
+  document.getElementById('modal-headline').textContent = headline;
+  document.getElementById('modal-sub').textContent =
+    'Camera ' + cam + '   ·   ' + timeTxt;
+  document.getElementById('modal-human').innerHTML = humanHtml;
+  document.getElementById('modal-dev-json').textContent = JSON.stringify(obj, null, 2);
+
+  // Snapshot evidence — show the JPEG if the server has one, else the
+  // "No snapshot captured" placeholder remains visible.
+  const img = document.getElementById('modal-evidence-img');
+  const txt = document.getElementById('modal-evidence-txt');
+  if(img && txt){
+    img.style.display = 'none';
+    txt.style.display = '';
+    if(obj.id != null){
+      img.onload = () => { img.style.display = ''; txt.style.display = 'none'; };
+      img.onerror = () => { img.style.display = 'none'; txt.style.display = ''; };
+      img.src = `/api/events/${obj.id}/snapshot`;
+    } else {
+      img.removeAttribute('src');
+    }
+  }
+
+  // Collapse developer details on each open so repeat-clicks don't preserve state.
+  const dev = document.querySelector('.modal-dev');
+  if(dev) dev.removeAttribute('open');
+
+  const m = document.getElementById('modal');
+  _modalPrevFocus = document.activeElement;
+  m.classList.remove('hidden');
+  // Focus the primary action so Enter naturally acknowledges (no custom handler needed).
+  setTimeout(() => {
+    const b = document.getElementById('btn-ack');
+    if(b) b.focus();
+  }, 0);
+}
+
+// Silent dismiss — does NOT log an action. Used by ✕, Escape, click-outside.
+// Acknowledge/Escalate call this after their own log+toast.
+function closeModal(){
+  const m = document.getElementById('modal');
+  if(!m || m.classList.contains('hidden')) return;
+  m.classList.add('hidden');
+  if(_modalPrevFocus && typeof _modalPrevFocus.focus === 'function'){
+    try{ _modalPrevFocus.focus(); } catch(_){}
+  }
+  _modalPrevFocus = null;
+  _modalCurrentEv = null;
+}
+
+function modalAck(){
+  const ev = _modalCurrentEv;
+  if(!ev){ closeModal(); return; }
+  console.log('action=ack', {id:ev.id, kind:ev.kind, ts:ev.ts});
+  _modalToast('Acknowledged · Event #' + (ev.id != null ? ev.id : '?'), 'var(--accent)');
+  closeModal();
+}
+
+function modalEscalate(){
+  const ev = _modalCurrentEv;
+  if(!ev){ closeModal(); return; }
+  console.log('action=escalate', {id:ev.id, kind:ev.kind, ts:ev.ts});
+  _modalToast('Escalated · supervisor will be notified (stub)', 'var(--yellow)');
+  closeModal();
+}
+
+function modalCopyJson(){
+  const ev = _modalCurrentEv;
+  if(!ev) return;
+  const txt = JSON.stringify(ev, null, 2);
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(txt).then(
+      () => _modalToast('Copied JSON to clipboard', 'var(--text2)'),
+      () => _modalToast('Copy failed', 'var(--red)')
+    );
+  } else {
+    _modalToast('Clipboard unavailable in this browser', 'var(--red)');
+  }
 }
 
 // ── Stream ────────────────────────────────────────────────────────────────────
@@ -811,6 +1261,345 @@ function initStream(){
     const delay=Math.min(3000*_streamRetries,20000);
     setTimeout(()=>{img.src='/proxy/stream?t='+Date.now();},delay);
   };
+}
+
+// ── Forbidden zones overlay ───────────────────────────────────────────────────
+// Coordinate model:
+//   - Polygons stored / transmitted in image-content normalized space (0..1).
+//   - Render-time: convert to canvas pixels using the image's bounding rect.
+//   - Click-time: convert mouse position back to 0..1 with the same transform.
+// stream-img uses object-fit:contain so the rendered image rect equals
+// img.getBoundingClientRect() — no cover-crop math needed.
+
+const _zoneState = {
+  zones: [],            // [{id, name, polygon: [[x,y],...]}]
+  drawing: false,
+  draftPts: [],         // current draft polygon, normalized
+  hoverPt: null,        // last mouse position normalized; null when off-canvas
+  popup: null,          // currently-open delete popup element
+};
+
+function _zoneImgRect(){
+  const img = document.getElementById('stream-img');
+  const wrap = document.querySelector('.stream-wrap');
+  if(!img || !wrap) return null;
+  const ir = img.getBoundingClientRect();
+  const wr = wrap.getBoundingClientRect();
+  // Translate to wrapper-local (canvas is positioned to wrapper).
+  return {
+    left:   ir.left - wr.left,
+    top:    ir.top  - wr.top,
+    width:  ir.width,
+    height: ir.height,
+  };
+}
+
+function _zoneSyncCanvas(){
+  const canvas = document.getElementById('zone-canvas');
+  const wrap = document.querySelector('.stream-wrap');
+  if(!canvas || !wrap) return;
+  const wr = wrap.getBoundingClientRect();
+  // Canvas drawing-buffer == wrapper size; CSS already handles inset:0.
+  const dpr = Math.max(1, window.devicePixelRatio || 1);
+  canvas.width  = Math.max(1, Math.round(wr.width  * dpr));
+  canvas.height = Math.max(1, Math.round(wr.height * dpr));
+  canvas.style.width  = wr.width  + 'px';
+  canvas.style.height = wr.height + 'px';
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  zoneRender();
+}
+
+function _zoneNormToPx(p){
+  const r = _zoneImgRect();
+  if(!r) return [0, 0];
+  return [r.left + p[0] * r.width, r.top + p[1] * r.height];
+}
+
+function _zoneEvtToNorm(evt){
+  const r = _zoneImgRect();
+  if(!r) return null;
+  const wrap = document.querySelector('.stream-wrap');
+  const wr = wrap.getBoundingClientRect();
+  const lx = evt.clientX - wr.left;
+  const ly = evt.clientY - wr.top;
+  // Reject clicks outside the rendered image rect (letterbox area).
+  if(lx < r.left || lx > r.left + r.width) return null;
+  if(ly < r.top  || ly > r.top  + r.height) return null;
+  return [(lx - r.left) / r.width, (ly - r.top) / r.height];
+}
+
+// Ray-casting point-in-polygon for hit-testing existing zones (normalized space).
+function _zoneHit(normX, normY, polygon){
+  let inside = false;
+  for(let i = 0, j = polygon.length - 1; i < polygon.length; j = i++){
+    const xi = polygon[i][0], yi = polygon[i][1];
+    const xj = polygon[j][0], yj = polygon[j][1];
+    const intersect = ((yi > normY) !== (yj > normY)) &&
+      (normX < (xj - xi) * (normY - yi) / (yj - yi + 1e-12) + xi);
+    if(intersect) inside = !inside;
+  }
+  return inside;
+}
+
+function zoneRender(){
+  const canvas = document.getElementById('zone-canvas');
+  if(!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const wr = canvas.getBoundingClientRect();
+  ctx.clearRect(0, 0, wr.width, wr.height);
+
+  // Saved zones — translucent red fill + solid border + centered name.
+  ctx.lineWidth = 1.5;
+  ctx.font = '12px system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  for(const z of _zoneState.zones){
+    if(!z.polygon || z.polygon.length < 3) continue;
+    ctx.beginPath();
+    z.polygon.forEach((p, i) => {
+      const [x, y] = _zoneNormToPx(p);
+      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    });
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(255, 60, 60, 0.18)';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255, 60, 60, 0.95)';
+    ctx.stroke();
+    // Centroid label.
+    let cx = 0, cy = 0;
+    for(const p of z.polygon){ cx += p[0]; cy += p[1]; }
+    const [lx, ly] = _zoneNormToPx([cx / z.polygon.length, cy / z.polygon.length]);
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillText(z.name || '', lx + 1, ly + 1);
+    ctx.fillStyle = '#fff';
+    ctx.fillText(z.name || '', lx, ly);
+  }
+
+  // Draft polygon (drawing in progress) — translucent green.
+  if(_zoneState.drawing && _zoneState.draftPts.length > 0){
+    ctx.beginPath();
+    _zoneState.draftPts.forEach((p, i) => {
+      const [x, y] = _zoneNormToPx(p);
+      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    });
+    if(_zoneState.hoverPt){
+      const [x, y] = _zoneNormToPx(_zoneState.hoverPt);
+      ctx.lineTo(x, y);
+    }
+    ctx.strokeStyle = 'rgba(80, 255, 140, 0.95)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    if(_zoneState.draftPts.length >= 3 && _zoneState.hoverPt){
+      // Closing-edge preview, dashed.
+      ctx.save();
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      const [hx, hy] = _zoneNormToPx(_zoneState.hoverPt);
+      const [sx, sy] = _zoneNormToPx(_zoneState.draftPts[0]);
+      ctx.moveTo(hx, hy); ctx.lineTo(sx, sy);
+      ctx.strokeStyle = 'rgba(80, 255, 140, 0.7)';
+      ctx.stroke();
+      ctx.restore();
+    }
+    // Vertex dots.
+    ctx.fillStyle = 'rgba(80, 255, 140, 1.0)';
+    for(const p of _zoneState.draftPts){
+      const [x, y] = _zoneNormToPx(p);
+      ctx.beginPath(); ctx.arc(x, y, 3, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+}
+
+async function zoneFetchAll(){
+  try{
+    const r = await fetch('/api/zones');
+    if(!r.ok) throw new Error('http ' + r.status);
+    const data = await r.json();
+    _zoneState.zones = data.zones || [];
+    zoneRender();
+  } catch(e){
+    console.warn('zoneFetchAll failed', e);
+  }
+}
+
+async function zoneCreate(name, polygon){
+  const r = await fetch('/api/zones', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({name, polygon}),
+  });
+  if(!r.ok){
+    const err = await r.text();
+    throw new Error('Create failed: ' + err);
+  }
+  return r.json();
+}
+
+async function zoneDelete(id){
+  const r = await fetch('/api/zones/' + id, {method: 'DELETE'});
+  if(!r.ok) throw new Error('Delete failed: http ' + r.status);
+}
+
+function zoneClosePopup(){
+  if(_zoneState.popup){
+    _zoneState.popup.remove();
+    _zoneState.popup = null;
+  }
+}
+
+function zoneShowPopup(zone, clientX, clientY){
+  zoneClosePopup();
+  const wrap = document.querySelector('.stream-wrap');
+  if(!wrap) return;
+  const wr = wrap.getBoundingClientRect();
+  const div = document.createElement('div');
+  div.className = 'zone-popup';
+  div.style.left = (clientX - wr.left + 8) + 'px';
+  div.style.top  = (clientY - wr.top  + 8) + 'px';
+  div.innerHTML =
+    `<div class="zone-popup-name"></div>` +
+    `<button type="button">Delete</button>`;
+  div.querySelector('.zone-popup-name').textContent = zone.name || ('Zone #' + zone.id);
+  div.querySelector('button').addEventListener('click', async () => {
+    try{
+      await zoneDelete(zone.id);
+      await zoneFetchAll();
+      zoneClosePopup();
+    } catch(e){
+      alert(String(e));
+    }
+  });
+  wrap.appendChild(div);
+  _zoneState.popup = div;
+}
+
+function zoneToggleDraw(){
+  const btn = document.getElementById('zone-draw-btn');
+  const canvas = document.getElementById('zone-canvas');
+  const hint = document.getElementById('zone-hint');
+  if(_zoneState.drawing){
+    // Cancel.
+    _zoneState.drawing = false;
+    _zoneState.draftPts = [];
+    _zoneState.hoverPt = null;
+    canvas.classList.remove('drawing');
+    btn.classList.remove('active');
+    btn.textContent = 'Draw zone';
+    hint.classList.add('hidden');
+  } else {
+    zoneClosePopup();
+    _zoneState.drawing = true;
+    _zoneState.draftPts = [];
+    _zoneState.hoverPt = null;
+    canvas.classList.add('drawing');
+    btn.classList.add('active');
+    btn.textContent = 'Cancel';
+    hint.classList.remove('hidden');
+  }
+  zoneRender();
+}
+
+async function _zoneFinish(){
+  if(_zoneState.draftPts.length < 3){
+    return;
+  }
+  const points = _zoneState.draftPts.slice();
+  // End drawing mode immediately so the prompt isn't competing with canvas state.
+  zoneToggleDraw();
+  const name = (window.prompt('Zone name:', 'Forbidden zone') || '').trim();
+  if(!name) return;
+  try{
+    await zoneCreate(name, points);
+    await zoneFetchAll();
+  } catch(e){
+    alert(String(e));
+  }
+}
+
+function _zoneOnMove(evt){
+  if(_zoneState.drawing){
+    _zoneState.hoverPt = _zoneEvtToNorm(evt);
+    zoneRender();
+  }
+}
+
+function _zoneOnClick(evt){
+  if(_zoneState.drawing){
+    const p = _zoneEvtToNorm(evt);
+    if(!p) return;
+    _zoneState.draftPts.push(p);
+    zoneRender();
+    return;
+  }
+  // Not drawing — check for click on existing zone.
+  const p = _zoneEvtToNorm(evt);
+  if(!p) { zoneClosePopup(); return; }
+  for(const z of _zoneState.zones){
+    if(z.polygon && _zoneHit(p[0], p[1], z.polygon)){
+      zoneShowPopup(z, evt.clientX, evt.clientY);
+      return;
+    }
+  }
+  zoneClosePopup();
+}
+
+function _zoneOnDblClick(evt){
+  if(_zoneState.drawing){
+    evt.preventDefault();
+    // Drop the duplicate point that the second click added before dblclick fired.
+    if(_zoneState.draftPts.length > 1){
+      _zoneState.draftPts.pop();
+    }
+    _zoneFinish();
+  }
+}
+
+function _zoneOnKey(evt){
+  if(!_zoneState.drawing) return;
+  if(evt.key === 'Escape'){
+    evt.preventDefault();
+    zoneToggleDraw();
+  } else if(evt.key === 'Backspace'){
+    evt.preventDefault();
+    if(_zoneState.draftPts.length > 0){
+      _zoneState.draftPts.pop();
+      zoneRender();
+    }
+  }
+}
+
+function initZones(){
+  // Canvas listens for clicks only when in drawing mode (pointer-events:auto
+  // toggled via .drawing class). For click-to-delete we attach to the wrapper
+  // and gate by event target.
+  const canvas = document.getElementById('zone-canvas');
+  const wrap = document.querySelector('.stream-wrap');
+  if(!canvas || !wrap) return;
+  // Drawing-mode mouse handlers (canvas only).
+  canvas.addEventListener('mousemove', _zoneOnMove);
+  canvas.addEventListener('mouseleave', () => {
+    if(_zoneState.drawing){ _zoneState.hoverPt = null; zoneRender(); }
+  });
+  canvas.addEventListener('click', _zoneOnClick);
+  canvas.addEventListener('dblclick', _zoneOnDblClick);
+  // Click-to-delete: bypass the canvas (which has pointer-events:none when
+  // not drawing) by listening on the wrapper.
+  wrap.addEventListener('click', (evt) => {
+    if(_zoneState.drawing) return;
+    if(evt.target.closest('.zone-popup')) return;
+    if(evt.target.closest('.zone-toolbar')) return;
+    _zoneOnClick(evt);
+  });
+  document.addEventListener('keydown', _zoneOnKey);
+  // Resync the canvas on layout changes.
+  window.addEventListener('resize', _zoneSyncCanvas);
+  const img = document.getElementById('stream-img');
+  if(img){
+    img.addEventListener('load', _zoneSyncCanvas);
+  }
+  _zoneSyncCanvas();
+  zoneFetchAll();
 }
 
 // ── Clock ─────────────────────────────────────────────────────────────────────
@@ -849,10 +1638,10 @@ function initControls(){
     bPause.title=S.paused?'Resume live feed':'Pause live feed';
   };
   document.getElementById('btn-clear').onclick=()=>{S.feed=[];renderFeed()};
-  document.getElementById('modal-close').onclick=()=>
-    document.getElementById('modal').classList.add('hidden');
+  // Modal-close button uses inline onclick="closeModal()" in HTML.
+  // Overlay click-outside also silently dismisses (no action logged).
   document.getElementById('modal').onclick=function(e){
-    if(e.target===this)this.classList.add('hidden');
+    if(e.target===this) closeModal();
   };
   document.getElementById('btn-filter').onclick=()=>{
     S.filters.kind =document.getElementById('f-kind').value;
@@ -867,7 +1656,24 @@ function initControls(){
   };
   document.getElementById('btn-export').onclick=exportCSV;
   document.addEventListener('keydown',e=>{
-    if(e.key==='Escape')document.getElementById('modal').classList.add('hidden');
+    const m = document.getElementById('modal');
+    const modalOpen = m && !m.classList.contains('hidden');
+    if(e.key === 'Escape'){ if(modalOpen) closeModal(); return; }
+    if(!modalOpen) return;
+    // Tab focus trap — keep keyboard users cycled within the modal.
+    if(e.key === 'Tab'){
+      const focusable = m.querySelectorAll('button, summary, [tabindex]:not([tabindex="-1"])');
+      if(!focusable.length) return;
+      const first = focusable[0], last = focusable[focusable.length - 1];
+      if(e.shiftKey && document.activeElement === first){ e.preventDefault(); last.focus(); }
+      else if(!e.shiftKey && document.activeElement === last){ e.preventDefault(); first.focus(); }
+      return;
+    }
+    // Shift+E → Escalate (global shortcut while modal is open).
+    if(e.shiftKey && (e.key === 'E' || e.key === 'e')){ e.preventDefault(); modalEscalate(); }
+    // Enter is not intercepted — btn-ack is focused on open, so native
+    // button activation handles acknowledgment. This also lets the
+    // <details> summary toggle via Enter when user tabs to it.
   });
 }
 
@@ -898,14 +1704,19 @@ function tryParse(s){try{return JSON.parse(s)}catch{return s}}
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded',()=>{
   initStream();
+  initZones();
   initNotif();
   initControls();
   connectWS();
   fetchStats();
-  fetchFeed();
+  // Live-events panel intentionally starts empty: it only fills from new
+  // WebSocket events after page load. Historical events live in the
+  // History tab (fetchHist below). fetchFeed() retained as a function
+  // for the manual-refresh button if/when one lands.
   fetchHist();
   setInterval(tick,1000);
   setInterval(fetchStats,30000);
+  setInterval(zoneFetchAll, 5000);  // pick up zones added via API or other tabs
   setInterval(()=>{if(S.feed.length)renderFeed()},15000); // refresh rel-times
   tick();
 });
