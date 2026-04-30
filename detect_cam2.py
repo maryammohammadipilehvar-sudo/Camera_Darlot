@@ -83,14 +83,14 @@ CFG = {
     ),
     "camera_id": "cam_02",
 
-    # Detector
+    # Detector — 1080p inference + lower conf reaches further than 720p/0.35
     "yolo_model":      "models/yolov9c.pt",   # shared read-only with prod
-    "yolo_conf":       0.35,
+    "yolo_conf":       0.25,
     "yolo_iou":        0.5,
     "person_class_id": 0,                     # COCO 'person'
-    "infer_w":         1280,                  # downscale before YOLO
-    "infer_h":         720,
-    "inference_fps":   8.0,                   # ceiling, not floor
+    "infer_w":         1920,
+    "infer_h":         1080,
+    "inference_fps":   6.0,                   # ceiling, not floor
 
     # Distance estimation (pinhole, assumed-height).
     # Default focal_length_px is for the 2.8mm wide setting on a 1/2.8" 5MP
@@ -100,7 +100,7 @@ CFG = {
     "assumed_person_height_m": 1.7,
     "focal_length_px":         938.0,
     "far_threshold_m":         8.0,
-    "min_bbox_height_px":      20,            # ignore detections below this
+    "min_bbox_height_px":      12,            # ignore detections below this
 
     # Servers — MJPEG re-encodes the annotated frame at this size + fps so the
     # browser preview is fast even though inference runs on full 1440p frames.
@@ -108,7 +108,7 @@ CFG = {
     "mjpeg_w":         1280,
     "mjpeg_h":         720,
     "mjpeg_fps":       15,
-    "mjpeg_quality":   55,
+    "mjpeg_quality":   70,
     "health_port":     8082,                  # prod uses 8081
 
     # Observability
@@ -141,9 +141,12 @@ CFG = {
     "follow_zoom_far_only":       False,  # crop on any person, not just FAR
     "follow_zoom_padding":        1.4,    # tighter framing → bigger face
     "follow_zoom_smooth_alpha":   0.5,    # 0..1, larger = snappier
-    "follow_zoom_min_bbox_h_px":  30,     # ignore tiny detections
-    "follow_zoom_lock_s":         1.5,    # keep last crop for N seconds
-                                          # after person briefly disappears
+    "follow_zoom_min_bbox_h_px":  20,     # ignore tiny detections
+    "follow_zoom_lock_s":         1.5,    # hold last crop after brief drop
+    # Cap how aggressively we upscale. Bigger upscale = blurrier output. If
+    # the natural crop would need >max_upscale, we widen the crop instead so
+    # the face stays small but sharp. 3.0 keeps things readable.
+    "follow_zoom_max_upscale":    3.0,
 }
 
 
@@ -491,6 +494,22 @@ class _FollowZoom:
         else:
             bw = bh * self._aspect
 
+        # Cap upscale ratio: a tiny crop blown up to 720p is unreadably
+        # blurry. If the upscale ratio would exceed follow_zoom_max_upscale,
+        # widen the crop so the face is smaller on screen but sharper.
+        out_w = self._aspect * 720  # arbitrary; only the ratio matters here
+        out_h = 720
+        max_up = self._cfg.get("follow_zoom_max_upscale", 0)
+        if max_up and bw > 0:
+            min_bw = out_w / max_up
+            min_bh = out_h / max_up
+            if bw < min_bw:
+                bh *= min_bw / bw
+                bw = min_bw
+            if bh < min_bh:
+                bw *= min_bh / bh
+                bh = min_bh
+
         # Keep crop inside frame; if too big, scale down.
         if bw > fw:
             bh *= fw / bw
@@ -734,14 +753,20 @@ def main() -> None:
                     crop_src = annotated[y1:y2, x1:x2]
                     following = True
 
-        # Downscale + JPEG-encode for the MJPEG preview only.
+        # Resize to MJPEG output. INTER_AREA when shrinking (sharper),
+        # INTER_CUBIC when upscaling (less blocky than INTER_LINEAR).
         if (
             crop_src.shape[1] != CFG["mjpeg_w"]
             or crop_src.shape[0] != CFG["mjpeg_h"]
         ):
+            interp = (
+                cv2.INTER_CUBIC
+                if crop_src.shape[1] < CFG["mjpeg_w"]
+                else cv2.INTER_AREA
+            )
             preview = cv2.resize(
                 crop_src, (CFG["mjpeg_w"], CFG["mjpeg_h"]),
-                interpolation=cv2.INTER_LINEAR,
+                interpolation=interp,
             )
         else:
             preview = crop_src
