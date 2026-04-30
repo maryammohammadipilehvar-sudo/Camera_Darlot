@@ -329,6 +329,8 @@ class Cam2Session:
         self._csrf: Optional[str] = None
         self._user_token: Optional[str] = None  # echoed by login response
         self._lock = threading.Lock()
+        self._hb_thread: Optional[threading.Thread] = None
+        self._hb_stop = threading.Event()
 
     # ---- low-level HTTP -----------------------------------------------------
 
@@ -540,9 +542,11 @@ class Cam2Session:
         )
         if (
             isinstance(parsed, dict)
-            and parsed.get("error_code") == "expired"
+            and parsed.get("error_code") in ("expired", "no_heartbeat")
         ):
-            log.info("session expired; re-logging in")
+            log.info(
+                "session %s; re-logging in", parsed.get("error_code"),
+            )
             self._session_cookie = None
             self._csrf = None
             self.login()
@@ -582,10 +586,49 @@ class Cam2Session:
         )
         if (
             isinstance(parsed, dict)
-            and parsed.get("error_code") == "expired"
+            and parsed.get("error_code") in ("expired", "no_heartbeat")
         ):
             return False
         return status == 200
+
+    def start_heartbeat(self, interval_s: float = 30.0) -> None:
+        """Start a daemon thread that pings /API/Login/Heartbeat periodically.
+
+        Without this, the camera kills the session after a short idle window
+        and subsequent PTZ commands fail with ``error_code: no_heartbeat``.
+        Idempotent — calling twice on the same session is a no-op.
+
+        Args:
+            interval_s: Seconds between heartbeats. Default 30s; the camera
+                seems to want at most ~60s between pings on this firmware.
+        """
+        if self._hb_thread is not None and self._hb_thread.is_alive():
+            return
+
+        def _loop() -> None:
+            while not self._hb_stop.wait(interval_s):
+                try:
+                    if not self.heartbeat():
+                        log.info("heartbeat failed; re-logging in")
+                        try:
+                            self._session_cookie = None
+                            self._csrf = None
+                            self.login()
+                        except Exception as e:
+                            log.warning("heartbeat re-login failed: %s", e)
+                except Exception as e:
+                    log.warning("heartbeat error: %s", e)
+
+        self._hb_stop.clear()
+        self._hb_thread = threading.Thread(
+            target=_loop, name="cam2-heartbeat", daemon=True,
+        )
+        self._hb_thread.start()
+        log.info("heartbeat thread started (every %.0fs)", interval_s)
+
+    def stop_heartbeat(self) -> None:
+        """Signal the heartbeat thread to exit."""
+        self._hb_stop.set()
 
 
 # ─────────────────────────── env loader ────────────────────────────────────────

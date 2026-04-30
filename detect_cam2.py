@@ -459,6 +459,7 @@ def _maybe_init_zoom() -> Optional["_ZoomController"]:
     try:
         sess = session_from_env()
         sess.login()
+        sess.start_heartbeat(interval_s=30.0)
     except Exception as e:
         log.warning("cam2 login failed (%s); running detection-only", e)
         return None
