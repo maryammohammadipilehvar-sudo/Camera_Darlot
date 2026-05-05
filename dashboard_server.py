@@ -41,6 +41,9 @@ DASH_PORT   = int(os.getenv("DASH_PORT",   "8888"))
 DB_PATH     = os.getenv("DB_PATH", str(
     Path(__file__).parent / "sentinel_events.db"
 ))
+CLIP_DIR = Path(os.path.expanduser(
+    os.getenv("CLIP_DIR", "~/.local/share/darlot/clips")
+))
 SNAPSHOT_DIR = Path(os.path.expanduser(
     os.getenv("SNAPSHOT_DIR", "~/.local/share/darlot/snapshots")
 ))
@@ -882,6 +885,46 @@ def api_event_snapshot(event_id: int):
     return FileResponse(
         matches[-1],  # most recent if multiple epochs collide
         media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+@app.get("/api/events/{event_id}/clip")
+def api_event_clip(event_id: int):
+    """Serve the 5-second MP4 clip captured around this event (Phase 2b).
+
+    Same monotonic-id glob trick as snapshots — clips live in CLIP_DIR
+    named ``<start_epoch>_<monotonic_id>.mp4``. The clip writer thread
+    in detect.py finalises the file ~clip_post_s after the event
+    fires, so this endpoint can 404 briefly right after an alert
+    before turning into a 200 once the encoder lands the file.
+    """
+    try:
+        row = _conn().execute(
+            "SELECT detail FROM events WHERE id=?", (event_id,)
+        ).fetchone()
+    except Exception as e:
+        log.warning(f"clip db lookup failed event_id={event_id}: {e}")
+        return Response(status_code=404)
+    if not row:
+        return Response(status_code=404)
+    try:
+        detail = json.loads(row["detail"]) if isinstance(row["detail"], str) else (row["detail"] or {})
+    except Exception:
+        return Response(status_code=404)
+    monotonic_id = detail.get("event_id")
+    if not isinstance(monotonic_id, int):
+        return Response(status_code=404)
+    if not CLIP_DIR.is_dir():
+        return Response(status_code=404)
+    matches = sorted(CLIP_DIR.glob(f"*_{monotonic_id}.mp4"))
+    if not matches:
+        return Response(status_code=404)
+    # FileResponse handles HTTP Range requests automatically — the
+    # browser's <video> element scrubs by issuing partial-content GETs.
+    return FileResponse(
+        matches[-1],
+        media_type="video/mp4",
         headers={"Cache-Control": "public, max-age=86400"},
     )
 

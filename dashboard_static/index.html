@@ -550,6 +550,10 @@ td.trunc{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     <div class="modal-sub" id="modal-sub"></div>
     <div class="modal-scroll">
       <div class="modal-evidence">
+        <video id="modal-evidence-video" class="modal-evidence-img"
+               controls preload="metadata"
+               style="display:none; max-width:100%; max-height:100%;
+                      border-radius:4px; background:#000"></video>
         <img id="modal-evidence-img" class="modal-evidence-img"
              alt="Event snapshot" style="display:none; max-width:100%; border-radius:4px">
         <div class="modal-evidence-txt" id="modal-evidence-txt">No snapshot captured</div>
@@ -1370,19 +1374,38 @@ function openModal(evStr){
   document.getElementById('modal-human').innerHTML = humanHtml;
   document.getElementById('modal-dev-json').textContent = JSON.stringify(obj, null, 2);
 
-  // Snapshot evidence — show the JPEG if the server has one, else the
-  // "No snapshot captured" placeholder remains visible.
+  // Evidence panel — preference order: 5-second clip > snapshot JPEG >
+  // placeholder. The video element is loaded first; on metadata load
+  // it shows, on error we fall through to the image. The image itself
+  // falls through to the "No snapshot captured" placeholder if missing.
+  const vid = document.getElementById('modal-evidence-video');
   const img = document.getElementById('modal-evidence-img');
   const txt = document.getElementById('modal-evidence-txt');
-  if(img && txt){
+  if(vid && img && txt){
+    vid.style.display = 'none';
     img.style.display = 'none';
     txt.style.display = '';
+    txt.textContent = 'No snapshot captured';
+    try{ vid.pause(); }catch(_){}
+    vid.removeAttribute('src');
+    img.removeAttribute('src');
+
     if(obj.id != null){
-      img.onload = () => { img.style.display = ''; txt.style.display = 'none'; };
-      img.onerror = () => { img.style.display = 'none'; txt.style.display = ''; };
-      img.src = `/api/events/${obj.id}/snapshot`;
-    } else {
-      img.removeAttribute('src');
+      const tryImage = () => {
+        img.onload  = () => { img.style.display = ''; txt.style.display = 'none'; };
+        img.onerror = () => { img.style.display = 'none'; txt.style.display = ''; };
+        img.src = `/api/events/${obj.id}/snapshot`;
+      };
+      vid.onloadedmetadata = () => {
+        vid.style.display = '';
+        txt.style.display = 'none';
+        img.style.display = 'none';
+      };
+      vid.onerror = tryImage;
+      // If the server hasn't finished encoding yet (clip_post_s window
+      // not elapsed), GET will 404 → vid.onerror → tryImage. Operator
+      // can re-open the event a few seconds later to catch the clip.
+      vid.src = `/api/events/${obj.id}/clip`;
     }
   }
 
@@ -1405,6 +1428,10 @@ function openModal(evStr){
 function closeModal(){
   const m = document.getElementById('modal');
   if(!m || m.classList.contains('hidden')) return;
+  // Stop any in-progress clip playback so it doesn't keep streaming
+  // bytes after the modal is dismissed.
+  const vid = document.getElementById('modal-evidence-video');
+  if(vid){ try{ vid.pause(); }catch(_){} vid.removeAttribute('src'); }
   m.classList.add('hidden');
   if(_modalPrevFocus && typeof _modalPrevFocus.focus === 'function'){
     try{ _modalPrevFocus.focus(); } catch(_){}

@@ -128,6 +128,20 @@ CFG = {
     "snapshot_queue":   16,       # drop-newest on overflow
     "snapshot_keep":    1000,     # prune oldest by mtime when over cap
 
+    # Clip capture (Phase 2b — 5s MP4 around each fired event for the
+    # operator's modal player + insurance/OSHA export). Memory ceiling:
+    # clip_max_concurrent * (clip_pre_s + clip_post_s) * clip_fps * H*W*3.
+    # At 4 * 5s * 10fps * 640*360*3 ≈ 138 MB. Bumping pre/post or fps
+    # raises that linearly.
+    "clip_enabled":         True,
+    "clip_dir":             "~/.local/share/darlot/clips",
+    "clip_pre_s":           2.5,   # seconds before event in the saved clip
+    "clip_post_s":          2.5,   # seconds after event
+    "clip_fps":             10,    # encoded mp4 fps; ring buffer is throttled to match
+    "clip_keep":            200,   # prune oldest by mtime when over cap
+    "clip_max_concurrent":  4,     # bound memory if many alerts fire close together
+    "clip_queue":           8,     # writer queue depth
+
     # Site identity (Operator must edit per deployment.)
     "site_name":        "darlot-default",
 
@@ -421,6 +435,13 @@ _health = {
     "snapshot_errors":           0,
     "snapshot_queue_depth":      0,
     "snapshot_last_write_s_ago": None,
+    # Clip capture observability (Phase 2b)
+    "clip_count":                0,
+    "clip_errors":               0,
+    "clip_dropped":              0,
+    "clip_queue_depth":          0,
+    "clip_active":               0,
+    "clip_last_write_s_ago":     None,
     # Telegram notifier observability (also updated live in /health handler)
     "telegram_last_success_s_ago": None,
     "telegram_last_error":         _notifier_module_error or "not yet started",
@@ -604,6 +625,205 @@ def start_snapshot_writer(cfg: dict) -> None:
     ).start()
 
 
+# ─────────────────────────── CLIP CAPTURE (Phase 2b) ──────────────────────────
+# Rolling ring buffer of (ts, frame_copy) at clip_fps. On event fire, the
+# ring is snapshotted into a per-event "active" entry that keeps growing
+# for clip_post_s seconds, after which it's queued to the writer thread
+# for MP4 encoding. clip_max_concurrent caps memory when many alerts fire
+# close together; excess events get a snapshot only.
+_clip_ring: "collections.deque" = collections.deque()
+_clip_ring_lock = threading.Lock()
+_clip_active: "dict[int, dict]" = {}
+_clip_active_lock = threading.Lock()
+_clip_q: "queue.Queue" = queue.Queue(maxsize=CFG["clip_queue"])
+_clip_dir: Path = Path(os.path.expanduser(str(CFG["clip_dir"])))
+_clip_start_epoch = int(time.time())
+_clip_count = 0
+_clip_errors = 0
+_clip_dropped = 0
+_clip_last_write_ts = 0.0
+_clip_last_ring_push_ts = 0.0
+
+
+def _setup_clip_dir(cfg: dict) -> bool:
+    """Create the clip directory if missing. Degrades on failure."""
+    global _clip_dir
+    if not cfg.get("clip_enabled", True):
+        log.info("CLIP disabled in config; capture skipped")
+        return False
+    path = Path(os.path.expanduser(str(cfg["clip_dir"])))
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        _clip_dir = path
+        log.info(
+            "CLIP dir ready: %s (start_epoch=%d, keep=%d, fps=%d, pre/post=%.1f/%.1fs, max_concurrent=%d)",
+            path, _clip_start_epoch, cfg["clip_keep"], cfg["clip_fps"],
+            cfg["clip_pre_s"], cfg["clip_post_s"], cfg["clip_max_concurrent"],
+        )
+        return True
+    except Exception as e:
+        log.error("CLIP dir create failed (%s): clips disabled", e)
+        cfg["clip_enabled"] = False
+        return False
+
+
+def _clip_publish_frame(ts: float, frame) -> None:
+    """Append the latest annotated frame to the ring + every active capture.
+
+    Throttled to clip_fps so the ring doesn't grow with the camera's
+    native frame rate. Called once per main-loop iteration after the
+    annotated frame is ready.
+    """
+    global _clip_last_ring_push_ts
+    if not CFG.get("clip_enabled", True):
+        return
+    fps = max(int(CFG.get("clip_fps", 10)), 1)
+    min_dt = 1.0 / fps
+    if (ts - _clip_last_ring_push_ts) < min_dt:
+        return
+    _clip_last_ring_push_ts = ts
+
+    try:
+        copy = frame.copy()
+    except Exception:
+        return  # frame got rebound mid-publish — ignore this tick
+
+    pre_s = float(CFG.get("clip_pre_s", 2.5))
+    cutoff = ts - pre_s
+    with _clip_ring_lock:
+        _clip_ring.append((ts, copy))
+        # Trim by time so the ring never exceeds clip_pre_s of history.
+        while _clip_ring and _clip_ring[0][0] < cutoff:
+            _clip_ring.popleft()
+
+    # Append to active captures and finalise the ones whose deadline has passed.
+    finished: list = []
+    with _clip_active_lock:
+        for event_id, st in list(_clip_active.items()):
+            st["frames"].append((ts, copy))
+            if ts >= st["deadline"]:
+                finished.append((event_id, st))
+                del _clip_active[event_id]
+
+    for event_id, st in finished:
+        _clip_finalise(event_id, st)
+
+
+def _clip_request(event_id: int) -> "str | None":
+    """Snapshot the ring buffer + start a per-event post-capture window.
+
+    Returns the expected MP4 path (the writer hasn't produced it yet)
+    or None when clips are disabled / over the concurrency cap. Called
+    from emit_alert, alongside _snapshot_enqueue.
+    """
+    global _clip_dropped
+    if not CFG.get("clip_enabled", True):
+        return None
+    cap = int(CFG.get("clip_max_concurrent", 4))
+    with _clip_active_lock:
+        if len(_clip_active) >= cap:
+            _clip_dropped += 1
+            log.warning(
+                "CLIP concurrent cap reached (%d) — event=%d gets snapshot only",
+                cap, event_id,
+            )
+            return None
+        with _clip_ring_lock:
+            seed = list(_clip_ring)  # tuples are (ts, ndarray ref) — cheap
+        post_s = float(CFG.get("clip_post_s", 2.5))
+        _clip_active[event_id] = {
+            "frames":   seed,
+            "deadline": time.time() + post_s,
+        }
+    target = _clip_dir / f"{_clip_start_epoch}_{event_id}.mp4"
+    return str(target)
+
+
+def _clip_finalise(event_id: int, st: dict) -> None:
+    """Hand a completed capture off to the writer thread (non-blocking)."""
+    target = _clip_dir / f"{_clip_start_epoch}_{event_id}.mp4"
+    try:
+        _clip_q.put_nowait((target, st["frames"], int(CFG.get("clip_fps", 10))))
+    except queue.Full:
+        log.warning(
+            "CLIP queue full — dropped event=%d (frames=%d)",
+            event_id, len(st["frames"]),
+        )
+
+
+def _clip_prune(directory: Path, keep: int) -> None:
+    try:
+        files = [
+            (f.stat().st_mtime, f)
+            for f in directory.iterdir()
+            if f.is_file() and f.suffix == ".mp4"
+        ]
+        if len(files) <= keep:
+            return
+        files.sort(key=lambda x: x[0])
+        for _mtime, path in files[: len(files) - keep]:
+            try:
+                path.unlink()
+            except Exception as e:
+                log.warning("CLIP prune failed for %s: %s", path, e)
+    except Exception as e:
+        log.warning("CLIP prune listing failed: %s", e)
+
+
+def _clip_writer(cfg: dict) -> None:
+    """Background thread — encode queued (frames → MP4) jobs.
+
+    Uses cv2.VideoWriter with the 'mp4v' fourcc — broadly available on
+    the Jetson without needing an extra ffmpeg shell-out. If the encoder
+    can't open the target (codec missing, disk full), we log and drop.
+    """
+    global _clip_count, _clip_errors, _clip_last_write_ts
+    log.info("CLIP writer thread started")
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    while True:
+        try:
+            item = _clip_q.get(timeout=1.0)
+        except queue.Empty:
+            continue
+        if item is None:
+            break  # reserved shutdown sentinel
+        target, frames, fps = item
+        if not frames:
+            continue
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            h, w = frames[0][1].shape[:2]
+            writer = cv2.VideoWriter(str(target), fourcc, float(fps), (w, h))
+            if not writer.isOpened():
+                raise IOError(f"VideoWriter could not open {target}")
+            for _ts, fr in frames:
+                writer.write(fr)
+            writer.release()
+            _clip_count += 1
+            _clip_last_write_ts = time.time()
+            _hset(clip_count=_clip_count)
+            _clip_prune(_clip_dir, cfg["clip_keep"])
+            log.info(
+                "CLIP wrote %s (%d frames, %.1fs at %dfps)",
+                target.name, len(frames),
+                len(frames) / max(fps, 1), fps,
+            )
+        except Exception as e:
+            _clip_errors += 1
+            _hset(clip_errors=_clip_errors)
+            log.error("CLIP write failed: %s err=%s", target, e)
+
+
+def start_clip_writer(cfg: dict) -> None:
+    """Spawn the clip writer thread if clips are enabled."""
+    if not cfg.get("clip_enabled", True):
+        log.info("CLIP disabled — writer thread not started")
+        return
+    threading.Thread(
+        target=_clip_writer, args=(cfg,), daemon=True, name="clip",
+    ).start()
+
+
 # ─────────────────────────── FRAME BUS ────────────────────────────────────────
 class _FrameBus:
     def __init__(self):
@@ -667,6 +887,16 @@ class _HealthHandler(http.server.BaseHTTPRequestHandler):
                 _health["snapshot_last_write_s_ago"] = (
                     int(time.time() - _snapshot_last_write_ts)
                     if _snapshot_last_write_ts > 0 else None
+                )
+                _health["clip_count"]   = _clip_count
+                _health["clip_errors"]  = _clip_errors
+                _health["clip_dropped"] = _clip_dropped
+                _health["clip_queue_depth"] = _clip_q.qsize()
+                with _clip_active_lock:
+                    _health["clip_active"] = len(_clip_active)
+                _health["clip_last_write_s_ago"] = (
+                    int(time.time() - _clip_last_write_ts)
+                    if _clip_last_write_ts > 0 else None
                 )
                 # Notifier / Telegram observability.
                 _health["notifier_queue_depth"] = _notify_q.qsize()
@@ -1799,6 +2029,7 @@ def emit_alert(camera_id: str, kind: str, detail: dict) -> None:
 
     # Fired path (telegram or dashboard_only): write events row + Telegram.
     snapshot_path = _snapshot_enqueue(event_id)
+    clip_path = _clip_request(event_id)
     payload = {
         "camera":   camera_id,
         "kind":     kind,
@@ -1810,6 +2041,11 @@ def emit_alert(camera_id: str, kind: str, detail: dict) -> None:
         # dashboard's severity-meta keys ('critical'/'high'/'medium'/...).
         "severity": severity.lower(),
         "event_id": event_id,
+        # Set even when the file doesn't exist yet — the writer thread
+        # produces it ~clip_post_s seconds after the event fires. The
+        # dashboard's /api/events/{id}/clip endpoint globs the dir and
+        # 404s gracefully when the file isn't there yet.
+        "has_clip": clip_path is not None,
     }
     try:
         _alert_q.put_nowait(payload)
@@ -2589,6 +2825,8 @@ def run(cfg: dict):
         start_thermal_monitor(cfg)
         _setup_snapshot_dir(cfg)
         start_snapshot_writer(cfg)
+        _setup_clip_dir(cfg)
+        start_clip_writer(cfg)
         start_notify_worker(cfg)
 
     # ── Load models ────────────────────────────────────────────────────────────
@@ -2833,6 +3071,7 @@ def run(cfg: dict):
                 draw_hud(vis_snap, fps, len(last_tracks), _health.get("thermal_c", 0.0))
                 global _snapshot_frame
                 _snapshot_frame = vis_snap
+                _clip_publish_frame(time.time(), vis_snap)
 
                 # First pass: collect phone bboxes for the phone-use check.
                 phone_bboxes: list = []
@@ -3016,6 +3255,7 @@ def run(cfg: dict):
             # this; in-loop alerts read the earlier publish made before
             # emits, so they match the frame that triggered them.
             _snapshot_frame = vis
+            _clip_publish_frame(time.time(), vis)
 
             ok, jpg = cv2.imencode(
                 ".jpg", vis,
