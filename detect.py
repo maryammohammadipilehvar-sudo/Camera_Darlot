@@ -228,7 +228,7 @@ CFG = {
     # backward compat — translates to ["forbidden_zone"] at startup
     # with a one-time deprecation log line. Mixing both raises at
     # import time so misconfigurations are loud, not subtle.
-    "alert_kind_allowlist": ["forbidden_zone", "phone_use", "predicted_intrusion", "dog"],
+    "alert_kind_allowlist": ["forbidden_zone", "phone_use", "dog"],
 
     # ── Phone-use detection ────────────────────────────────────────
     # phone_use_containment is the PRODUCTION metric: fraction of the
@@ -253,6 +253,12 @@ CFG = {
     "predict_min_velocity_px_s":     30.0,
     "predict_breach_consecutive":    3,
     "predict_track_ttl_s":           3.0,
+
+    # Feature toggles — flip to True to re-enable.
+    # behavior_enabled: BehaviorAnalyzer (pose-based fighting/fallen/running).
+    # predicted_intrusion_enabled: trajectory-extrapolation rule above.
+    "behavior_enabled":              False,
+    "predicted_intrusion_enabled":   False,
 
     # Default 0.3 = "at least 30% of the phone overlaps the (padded)
     # person bbox." Loose enough to handle bbox jitter when the phone
@@ -2524,16 +2530,20 @@ def run(cfg: dict):
     yolo      = load_yolo(cfg["yolo_engine"])
     tracker   = _init_bytetrack()
 
-    # Behavior analyzer (graceful degradation if pose model not present)
+    # Behavior analyzer (graceful degradation if pose model not present).
+    # Gated by cfg["behavior_enabled"] — flip to True to re-enable.
     beh_analyzer = None
-    try:
-        from behavior import BehaviorAnalyzer, draw_behavior
-        beh_analyzer = BehaviorAnalyzer(cfg["pose_engine"])
-        beh_analyzer.start_thread(emit_alert, cfg["camera_id"])
-        _hset(behavior_ready=True)
-        log.info("Behavior analyzer ready")
-    except Exception as e:
-        log.warning(f"Behavior analyzer unavailable: {e}")
+    if cfg.get("behavior_enabled"):
+        try:
+            from behavior import BehaviorAnalyzer, draw_behavior
+            beh_analyzer = BehaviorAnalyzer(cfg["pose_engine"])
+            beh_analyzer.start_thread(emit_alert, cfg["camera_id"])
+            _hset(behavior_ready=True)
+            log.info("Behavior analyzer ready")
+        except Exception as e:
+            log.warning(f"Behavior analyzer unavailable: {e}")
+    else:
+        log.info("Behavior analyzer disabled (cfg.behavior_enabled=False)")
 
     face_det  = None    # SCRFDDetector(cfg["scrfd_model"])  — re-enable when stable
     face_emb  = None    # AdaFaceEmbedder(cfg["adaface_model"])
@@ -2555,11 +2565,13 @@ def run(cfg: dict):
     #          same forbidden polygons; fires as an early warning before
     #          the person actually crosses the boundary).
     # Future phases: ppe_violation, port phone_use + detection emits.
-    rules_engine = RulesEngine([
-        ForbiddenZoneRule(forbidden),
-        PredictedIntrusionRule(forbidden),
-        LoiteringRule(zones),
-    ])
+    _rules: list = [ForbiddenZoneRule(forbidden)]
+    if cfg.get("predicted_intrusion_enabled"):
+        _rules.append(PredictedIntrusionRule(forbidden))
+    else:
+        log.info("PredictedIntrusionRule disabled (cfg.predicted_intrusion_enabled=False)")
+    _rules.append(LoiteringRule(zones))
+    rules_engine = RulesEngine(_rules)
     log.info(
         "RULES engine ready: %s",
         ", ".join(r.name for r in rules_engine.rules) or "(none)",
