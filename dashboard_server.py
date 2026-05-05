@@ -109,6 +109,16 @@ def init_db():
                 updated_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_fz_updated ON forbidden_zones(updated_at);
+            CREATE TABLE IF NOT EXISTS event_actions (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id  INTEGER NOT NULL,
+                action    TEXT    NOT NULL,
+                actor     TEXT    NOT NULL DEFAULT 'operator',
+                ts        INTEGER NOT NULL,
+                note      TEXT    NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_ea_event   ON event_actions(event_id);
+            CREATE INDEX IF NOT EXISTS idx_ea_actts   ON event_actions(action, ts);
         """)
         _migrate_forbidden_zones(c)
         c.commit()
@@ -196,15 +206,37 @@ def db_stats() -> dict:
             ).fetchone()[0]
             hourly.append(cnt)
 
+        # False-alarm rate (Phase 2a). Joins event_actions on event_id
+        # to attribute each false_alarm back to the camera that produced
+        # the underlying event. 7-day window — matches the operator
+        # spec target of "<2 false alarms per camera per week".
+        seven_days_ago = now - 7 * 86400
+        try:
+            fp_rows = c.execute(
+                "SELECT e.camera AS camera, COUNT(*) AS c "
+                "FROM event_actions ea "
+                "JOIN events e ON e.id = ea.event_id "
+                "WHERE ea.action='false_alarm' AND ea.ts>=? "
+                "GROUP BY e.camera",
+                (seven_days_ago,),
+            ).fetchall()
+            fp_last_7d = {r["camera"]: r["c"] for r in fp_rows}
+        except sqlite3.OperationalError:
+            # event_actions table absent (pre-Phase-2a DB).
+            fp_last_7d = {}
+
         c.close()
 
+    fp_budget = {cam: (fp_last_7d.get(cam, 0) > 2) for cam in cameras}
     return {
-        "total":     total,
-        "today":     today,
-        "last_hour": last_hour,
-        "by_kind":   by_kind,
-        "cameras":   cameras,
-        "hourly":    hourly,
+        "total":      total,
+        "today":      today,
+        "last_hour":  last_hour,
+        "by_kind":    by_kind,
+        "cameras":    cameras,
+        "hourly":     hourly,
+        "fp_last_7d": fp_last_7d,
+        "fp_over_budget": fp_budget,
     }
 
 def format_event_for_ui(event: dict) -> dict:
@@ -704,6 +736,114 @@ def api_zones_delete(zone_id: int):
         raise HTTPException(status_code=404, detail="zone not found")
     log.info(f"forbidden_zone deleted id={zone_id}")
     return Response(status_code=204)
+
+
+_VALID_ACTIONS = {"acknowledge", "dispatch", "false_alarm"}
+
+
+class ActionCreate(BaseModel):
+    action: str
+    actor: str = "operator"
+    note: str = ""
+
+
+def _row_to_action(row) -> dict:
+    return {
+        "id":       row["id"],
+        "event_id": row["event_id"],
+        "action":   row["action"],
+        "actor":    row["actor"],
+        "ts":       row["ts"],
+        "note":     row["note"],
+    }
+
+
+@app.post("/api/events/{event_id}/actions", status_code=201)
+def api_event_action_create(event_id: int, payload: ActionCreate):
+    """Record an operator action on an event (Acknowledge / Dispatch / False alarm).
+
+    Multiple actions may exist per event (an event can be acknowledged,
+    then escalated via dispatch, then later marked false_alarm). We
+    keep the full timeline so the audit / insurance export is complete.
+    """
+    action = str(payload.action).strip().lower()
+    if action not in _VALID_ACTIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"action must be one of {sorted(_VALID_ACTIONS)}",
+        )
+    actor = (payload.actor or "operator").strip()[:64] or "operator"
+    note = (payload.note or "").strip()[:500]
+    now = int(time.time())
+    with _db_lock:
+        c = _conn()
+        ev = c.execute("SELECT id FROM events WHERE id=?", (event_id,)).fetchone()
+        if not ev:
+            c.close()
+            raise HTTPException(status_code=404, detail="event not found")
+        cur = c.execute(
+            "INSERT INTO event_actions (event_id, action, actor, ts, note) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (event_id, action, actor, now, note),
+        )
+        row_id = cur.lastrowid
+        c.commit()
+        row = c.execute(
+            "SELECT id, event_id, action, actor, ts, note "
+            "FROM event_actions WHERE id=?", (row_id,),
+        ).fetchone()
+        c.close()
+    log.info(f"event_action recorded event_id={event_id} action={action} actor={actor!r}")
+    return _row_to_action(row)
+
+
+@app.get("/api/events/{event_id}/actions")
+def api_event_actions_list(event_id: int):
+    """Return the action timeline (oldest first) for one event."""
+    with _db_lock:
+        c = _conn()
+        rows = c.execute(
+            "SELECT id, event_id, action, actor, ts, note "
+            "FROM event_actions WHERE event_id=? ORDER BY ts ASC",
+            (event_id,),
+        ).fetchall()
+        c.close()
+    return {"actions": [_row_to_action(r) for r in rows]}
+
+
+@app.get("/api/events/actions/latest")
+def api_event_actions_latest(ids: str = Query(default="")):
+    """Batch lookup: latest action per event id, keyed by id.
+
+    Frontend calls this once per events feed render so cards can show
+    "Acked by X" without an N+1. Returns ``{}`` for unknown ids.
+    """
+    raw = [s for s in (ids or "").split(",") if s.strip()]
+    parsed: list = []
+    for s in raw:
+        try:
+            parsed.append(int(s))
+        except ValueError:
+            continue
+    if not parsed:
+        return {}
+    placeholders = ",".join("?" * len(parsed))
+    with _db_lock:
+        c = _conn()
+        # Latest action per event_id (max(ts) wins). SQLite-friendly
+        # subquery: select rows where (event_id, ts) matches the max ts
+        # for that event_id.
+        rows = c.execute(
+            f"SELECT id, event_id, action, actor, ts, note FROM event_actions "
+            f"WHERE event_id IN ({placeholders}) "
+            f"AND (event_id, ts) IN ("
+            f"  SELECT event_id, MAX(ts) FROM event_actions "
+            f"  WHERE event_id IN ({placeholders}) GROUP BY event_id"
+            f")",
+            parsed + parsed,
+        ).fetchall()
+        c.close()
+    return {str(r["event_id"]): _row_to_action(r) for r in rows}
 
 
 @app.get("/api/events/{event_id}/snapshot")

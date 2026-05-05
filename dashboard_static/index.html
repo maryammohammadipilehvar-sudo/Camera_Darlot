@@ -355,6 +355,22 @@ body::after{content:'';position:fixed;inset:0;
 .sev-t-low     {color:var(--sev-low-text)}
 .sev-t-info    {color:var(--sev-info-text)}
 
+/* ─── Event-card action buttons (Phase 2a) ────────────────────────────── */
+.ev-actions{display:flex;gap:6px;margin-top:6px;flex-wrap:wrap}
+.ev-actions button{font-size:10.5px;font-weight:600;letter-spacing:.6px;
+  padding:3px 9px;border-radius:3px;cursor:pointer;border:1px solid;
+  background:transparent;color:var(--text2);border-color:var(--border2);
+  font-family:var(--font-ui);transition:background .15s,color .15s,border-color .15s}
+.ev-actions button:hover{color:var(--accent);border-color:var(--accent)}
+.ev-actions .act-fa:hover{color:var(--red);border-color:var(--red)}
+.ev-actions .act-disp:hover{color:var(--yellow);border-color:var(--yellow)}
+.ev-footer{margin-top:6px;font-size:10.5px;color:var(--text3);font-style:italic;
+  letter-spacing:.3px;font-family:var(--font-mono)}
+.ev-footer .ev-fact{color:var(--text2);font-style:normal;font-weight:600}
+.ev-footer.ev-fa{color:var(--red)}
+.ev-footer.ev-ack{color:var(--accent)}
+.ev-footer.ev-disp{color:var(--yellow)}
+
 /* ─── Badges ──────────────────────────────────────────────────────────────── */
 .badge{display:inline-block;padding:2px 8px;border-radius:3px;
   font-size:10.5px;font-weight:700;letter-spacing:1px;border:1px solid currentColor;
@@ -906,6 +922,81 @@ function renderKPIs(flash=false){
   set('kv-up',    s.uptime_s!=null?fmtUp(s.uptime_s):'—',false);
 }
 
+// Latest action keyed by event id, populated by _fetchActionsBatch.
+S.actions = {};
+
+const ACTION_LABEL = {
+  acknowledge: 'Acknowledged',
+  dispatch:    'Supervisor dispatched',
+  false_alarm: 'False alarm',
+};
+const ACTION_FOOTER_CLASS = {
+  acknowledge: 'ev-ack',
+  dispatch:    'ev-disp',
+  false_alarm: 'ev-fa',
+};
+
+function _renderActionFooter(act){
+  if(!act) return '';
+  const label = ACTION_LABEL[act.action] || act.action;
+  const cls = ACTION_FOOTER_CLASS[act.action] || '';
+  const who = act.actor && act.actor !== 'operator' ? `by ${escAttr(act.actor)} ` : '';
+  const when = rel(act.ts);
+  return `<div class="ev-footer ${cls}"><span class="ev-fact">${label}</span> ${who}· ${when}</div>`;
+}
+
+function _renderActionButtons(eventId){
+  // Three buttons; click stops propagation so the card's onclick (openModal)
+  // doesn't fire when an action button is hit.
+  return `<div class="ev-actions" onclick="event.stopPropagation()">
+    <button type="button" onclick="recordAction(${eventId},'acknowledge')">Acknowledge</button>
+    <button type="button" class="act-disp" onclick="recordAction(${eventId},'dispatch')">Dispatch</button>
+    <button type="button" class="act-fa" onclick="recordAction(${eventId},'false_alarm')">False alarm</button>
+  </div>`;
+}
+
+async function recordAction(eventId, action){
+  if(!eventId) return;
+  try{
+    const r = await fetch(`/api/events/${eventId}/actions`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({action}),
+    });
+    if(!r.ok){
+      const err = await r.text();
+      throw new Error('http ' + r.status + ' ' + err);
+    }
+    const a = await r.json();
+    S.actions[String(eventId)] = a;
+    renderFeed();
+  } catch(e){
+    alert('Action failed: ' + e.message);
+  }
+}
+
+async function _fetchActionsBatch(eventIds){
+  const fresh = eventIds.filter(id => id && !S.actions[String(id)]);
+  if(!fresh.length) return;
+  try{
+    const r = await fetch('/api/events/actions/latest?ids=' + fresh.join(','));
+    if(!r.ok) return;
+    const data = await r.json();
+    let changed = false;
+    for(const k of Object.keys(data)){
+      if(!S.actions[k]){ S.actions[k] = data[k]; changed = true; }
+    }
+    if(changed) renderFeed();
+  } catch(_){ /* network blip — try again next render */ }
+}
+
+// Tiny HTML-attribute escaper for ad-hoc strings (actor name etc.).
+function escAttr(s){
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[c]));
+}
+
 function renderFeed(){
   const feed=document.getElementById('events-feed');
   const empty=document.getElementById('events-empty');
@@ -929,6 +1020,9 @@ function renderFeed(){
     const sev = severityOf(ev);
     const sevMeta = SEVERITY_META[sev] || SEVERITY_META.info;
     const sevCls = sev === 'critical' ? ' sev-crit' : '';
+    const action = ev.id != null ? S.actions[String(ev.id)] : null;
+    const footer = _renderActionFooter(action);
+    const buttons = ev.id != null && !action ? _renderActionButtons(ev.id) : '';
     return `<div class="ev-card${sevCls}" onclick='openModal(${esc(ev)})'>
       <div class="ev-bar" style="background:${sevMeta.color}"></div>
       <div class="ev-body">
@@ -938,9 +1032,15 @@ function renderFeed(){
           <span class="ev-time">${t}</span>
         </div>
         <div class="ev-detail sev-t-${sev}">${s}</div>
+        ${buttons}
+        ${footer}
       </div>
     </div>`;
   }).join('');
+
+  // Background-fetch latest actions for any unknown ids; cards re-render
+  // when the data lands.
+  _fetchActionsBatch(liveEvents.map(ev => ev.id).filter(x => x != null));
 }
 
 function renderHist(evts){
@@ -955,15 +1055,19 @@ function renderHist(evts){
     const timeTxt = ev.display_time || fmtTs(ev.ts);
     const cam = ev.display_camera || ev.camera || '';
     const sev = severityOf(ev);
+    const action = ev.id != null ? S.actions[String(ev.id)] : null;
+    const actLine = action ? _renderActionFooter(action) : '';
     return `<tr>
       <td class="mono dim">${ev.id}</td>
       <td class="mono">${timeTxt}</td>
       <td>${cam}</td>
       <td><span class="badge ${m.cls}">${m.lbl}</span></td>
-      <td class="trunc sev-t-${sev}">${s||'<span style="color:var(--text3)">—</span>'}</td>
+      <td class="trunc sev-t-${sev}">${s||'<span style="color:var(--text3)">—</span>'}${actLine}</td>
       <td><button class="sb" onclick='openModal(${esc(ev)})'>view</button></td>
     </tr>`;
   }).join('');
+
+  _fetchActionsBatch(evts.map(ev => ev.id).filter(x => x != null));
 }
 
 function renderPager(){
