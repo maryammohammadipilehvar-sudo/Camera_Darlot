@@ -179,4 +179,13 @@ class ForbiddenZoneRule(Rule):
         }
         if dwell_elapsed_s > 0:
             detail["dwell_elapsed_s"] = round(dwell_elapsed_s, 2)
+        # Shadow mode: zones in their post-deploy shake-down window stamp
+        # the event so emit_alert downgrades it to dashboard-only
+        # routing (no Telegram). The dashboard uses this flag to render
+        # a SHADOW badge so the operator sees nothing was paged.
+        shadow_until = int(zone.get("shadow_until", 0) or 0)
+        import time as _t
+        if shadow_until and _t.time() < shadow_until:
+            detail["shadow"] = True
+            detail["shadow_until"] = shadow_until
         return RuleResult(kind="forbidden_zone", detail=detail)

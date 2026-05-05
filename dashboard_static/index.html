@@ -174,9 +174,48 @@ body::after{content:'';position:fixed;inset:0;
   box-shadow:0 0 12px var(--accent-glow)}
 
 /* ─── View containers ─────────────────────────────────────────────────────── */
-#view-live, #view-history{flex:1;min-height:0;display:flex;flex-direction:column}
-#view-history{padding:var(--gap);overflow:hidden}
-#view-history.hidden, #view-live.hidden{display:none}
+#view-live, #view-history, #view-reports{flex:1;min-height:0;display:flex;flex-direction:column}
+#view-history, #view-reports{padding:var(--gap);overflow:hidden}
+#view-history.hidden, #view-live.hidden, #view-reports.hidden{display:none}
+#view-reports{overflow-y:auto}
+#view-reports .reports-wrap{max-width:1100px;margin:0 auto;width:100%}
+#view-reports h2{font-size:18px;font-weight:600;letter-spacing:.5px;margin:0 0 4px;
+  color:var(--text)}
+#view-reports .reports-sub{font-family:var(--font-mono);font-size:11.5px;
+  color:var(--text2);margin-bottom:18px}
+#view-reports .reports-controls{display:flex;gap:8px;align-items:center;
+  margin-bottom:18px;flex-wrap:wrap}
+#view-reports .reports-controls select,
+#view-reports .reports-controls input{padding:6px 10px;background:var(--bg);
+  border:1px solid var(--border);border-radius:var(--r);color:var(--text);
+  font-family:var(--font-ui);font-size:12px}
+#view-reports .tile-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));
+  gap:10px;margin-bottom:18px}
+.r-tile{background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);
+  padding:14px 16px}
+.r-tile .lbl{font-size:10.5px;letter-spacing:1.4px;color:var(--text2);
+  font-weight:600;text-transform:uppercase}
+.r-tile .val{font-size:24px;font-weight:600;color:var(--text);margin-top:4px}
+.r-tile .sub{font-size:11px;color:var(--text3);margin-top:2px;font-family:var(--font-mono)}
+.r-tile.r-bad .val{color:var(--red)}
+.r-tile.r-good .val{color:var(--accent)}
+.r-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-bottom:18px}
+@media(max-width:760px){.r-grid{grid-template-columns:1fr}}
+.r-card{background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);
+  padding:14px 18px}
+.r-card h3{font-size:12px;letter-spacing:1.2px;text-transform:uppercase;
+  color:var(--text2);margin:0 0 10px;font-weight:600}
+.r-card table{width:100%;border-collapse:collapse;font-size:12.5px}
+.r-card th, .r-card td{text-align:left;padding:6px 4px;border-bottom:1px solid var(--border)}
+.r-card th{color:var(--text3);font-weight:500;font-size:10.5px;
+  text-transform:uppercase;letter-spacing:1px}
+.r-card td.num, .r-card th.num{text-align:right;font-family:var(--font-mono)}
+.r-card .empty{color:var(--text3);font-style:italic;font-size:11px;padding:10px 4px}
+.r-samples{display:flex;flex-wrap:wrap;gap:6px}
+.r-samples a{font-family:var(--font-mono);font-size:11px;padding:3px 8px;
+  background:var(--bg);border:1px solid var(--border2);border-radius:3px;
+  color:var(--text2);cursor:pointer;text-decoration:none}
+.r-samples a:hover{border-color:var(--accent);color:var(--accent)}
 
 /* History view (full-screen mode) — overrides the embedded panel sizing
    when shown as its own tab so the table breathes. */
@@ -364,6 +403,10 @@ body::after{content:'';position:fixed;inset:0;
 .ev-actions button:hover{color:var(--accent);border-color:var(--accent)}
 .ev-actions .act-fa:hover{color:var(--red);border-color:var(--red)}
 .ev-actions .act-disp:hover{color:var(--yellow);border-color:var(--yellow)}
+/* SHADOW pill: tells the operator "this didn't page anyone yet". */
+.shadow-pill{display:inline-block;font-size:9.5px;font-weight:700;
+  letter-spacing:1.4px;padding:1px 6px;border-radius:3px;border:1px solid;
+  color:var(--text2);border-color:var(--border2);background:var(--bg)}
 .ev-footer{margin-top:6px;font-size:10.5px;color:var(--text3);font-style:italic;
   letter-spacing:.3px;font-family:var(--font-mono)}
 .ev-footer .ev-fact{color:var(--text2);font-style:normal;font-weight:600}
@@ -601,6 +644,7 @@ td.trunc{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     <nav class="view-tabs" role="tablist" aria-label="Dashboard views">
       <button class="view-tab active" id="tab-live"    type="button" role="tab" aria-selected="true">Live</button>
       <button class="view-tab"        id="tab-history" type="button" role="tab" aria-selected="false">History</button>
+      <button class="view-tab"        id="tab-reports" type="button" role="tab" aria-selected="false">Reports</button>
     </nav>
 
     <div class="hdr-right">
@@ -724,6 +768,58 @@ td.trunc{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   </section>
 
   </div><!-- #view-history -->
+
+  <!-- ── REPORTS VIEW (Phase 3) ──────────────────────────────────────────────── -->
+  <div id="view-reports" class="hidden">
+    <div class="reports-wrap">
+      <h2>Weekly summary</h2>
+      <div class="reports-sub" id="r-window">—</div>
+
+      <div class="reports-controls">
+        <label style="font-size:11px;color:var(--text2);letter-spacing:.5px">Window
+          <select id="r-days" style="margin-left:8px">
+            <option value="7" selected>Last 7 days</option>
+            <option value="14">Last 14 days</option>
+            <option value="30">Last 30 days</option>
+          </select>
+        </label>
+        <label style="font-size:11px;color:var(--text2);letter-spacing:.5px">Camera
+          <select id="r-camera" style="margin-left:8px">
+            <option value="">All cameras</option>
+          </select>
+        </label>
+        <button class="sb" id="r-refresh">Refresh</button>
+      </div>
+
+      <div class="tile-row" id="r-tiles"></div>
+
+      <div class="r-grid">
+        <div class="r-card">
+          <h3>By kind</h3>
+          <table id="r-bykind"><thead><tr><th>Kind</th><th class="num">Count</th></tr></thead><tbody></tbody></table>
+        </div>
+        <div class="r-card">
+          <h3>By camera</h3>
+          <table id="r-bycamera"><thead><tr><th>Camera</th><th class="num">Count</th></tr></thead><tbody></tbody></table>
+        </div>
+      </div>
+
+      <div class="r-card" style="margin-bottom:18px">
+        <h3>Forbidden-zone breaches by zone</h3>
+        <table id="r-byzone"><thead><tr><th>Zone</th><th class="num">Count</th></tr></thead><tbody></tbody></table>
+      </div>
+
+      <div class="r-card" style="margin-bottom:18px">
+        <h3>False-alarm budget (target: &lt; 2 / camera / week)</h3>
+        <table id="r-fp"><thead><tr><th>Camera</th><th class="num">FP last window</th><th class="num">Per week</th><th>Status</th></tr></thead><tbody></tbody></table>
+      </div>
+
+      <div class="r-card">
+        <h3>Sample events for spot-check</h3>
+        <div class="r-samples" id="r-samples"></div>
+      </div>
+    </div>
+  </div><!-- #view-reports -->
 
 </div><!-- #app -->
 
@@ -912,6 +1008,121 @@ async function fetchFeed(){
   }catch{}
 }
 
+// ── Reports ──────────────────────────────────────────────────────────────────
+async function fetchReport(){
+  const days = document.getElementById('r-days').value;
+  const cam  = document.getElementById('r-camera').value;
+  const url  = `/api/reports/weekly?days=${encodeURIComponent(days)}` +
+               (cam ? `&camera=${encodeURIComponent(cam)}` : '');
+  try{
+    const r = await fetch(url);
+    if(!r.ok) throw new Error('http ' + r.status);
+    const data = await r.json();
+    renderReport(data);
+  } catch(e){
+    document.getElementById('r-window').textContent =
+      'Failed to load report: ' + e.message;
+  }
+}
+
+function _rTile(lbl, val, sub, cls){
+  return `<div class="r-tile ${cls || ''}">
+    <div class="lbl">${_htmlEsc(lbl)}</div>
+    <div class="val">${_htmlEsc(String(val))}</div>
+    ${sub ? `<div class="sub">${_htmlEsc(sub)}</div>` : ''}
+  </div>`;
+}
+
+function _rFillTable(tbodySel, rows, emptyMsg){
+  const tb = document.querySelector(tbodySel + ' tbody');
+  if(!tb) return;
+  if(!rows.length){
+    tb.innerHTML = `<tr><td colspan="4" class="empty">${_htmlEsc(emptyMsg)}</td></tr>`;
+    return;
+  }
+  tb.innerHTML = rows.map(r => '<tr>' + r.map((c, i) =>
+    `<td${i > 0 ? ' class="num"' : ''}>${_htmlEsc(String(c))}</td>`
+  ).join('') + '</tr>').join('');
+}
+
+function renderReport(data){
+  const since = new Date(data.window.since * 1000);
+  const until = new Date(data.window.until * 1000);
+  document.getElementById('r-window').textContent =
+    `${data.window.days} day window — ${fmtTs(data.window.since)} → ${fmtTs(data.window.until)}`;
+
+  // Tiles. Bold the FP tile when any camera is over budget.
+  const t = data.totals || {};
+  const sh = data.shadow || {count:0};
+  const ah = data.after_hours || {count:0};
+  const fp = data.fp || {by_camera:{}, per_camera_per_week:{}, over_budget_per_camera:{}};
+  const fpTotal = Object.values(fp.by_camera || {}).reduce((a,b) => a + b, 0);
+  const overBudget = Object.values(fp.over_budget_per_camera || {}).some(Boolean);
+  const tiles = [
+    _rTile('Total events',  t.events ?? 0),
+    _rTile('Shadow events', sh.count, 'no Telegram fired'),
+    _rTile('After-hours',   ah.count, 'forbidden_zone, 18:00–06:00'),
+    _rTile('False alarms',  fpTotal, `target < 2 / camera / week`,
+           overBudget ? 'r-bad' : (fpTotal === 0 ? 'r-good' : '')),
+  ];
+  document.getElementById('r-tiles').innerHTML = tiles.join('');
+
+  _rFillTable('#r-bykind',
+    Object.entries(t.by_kind || {}).map(([k,v]) => [_titleCase(k), v]),
+    'No events in window');
+  _rFillTable('#r-bycamera',
+    Object.entries(t.by_camera || {}).map(([k,v]) => [k, v]),
+    'No events in window');
+  _rFillTable('#r-byzone',
+    Object.entries(data.by_zone || {}).map(([k,v]) => [k, v]),
+    'No forbidden_zone events in window');
+
+  const fpRows = Object.keys(fp.by_camera || {}).map(cam => [
+    cam,
+    fp.by_camera[cam],
+    (fp.per_camera_per_week[cam] ?? 0).toFixed(2),
+    fp.over_budget_per_camera[cam] ? '⚠ over budget' : 'within budget',
+  ]);
+  _rFillTable('#r-fp', fpRows, 'No false-alarm actions recorded yet');
+
+  // Sample events — clickable chips that open the modal (with clip player).
+  const samples = data.sample_event_ids || [];
+  const target = document.getElementById('r-samples');
+  if(!samples.length){
+    target.innerHTML = '<div class="empty" style="color:var(--text3);font-style:italic">No events to spot-check yet.</div>';
+  } else {
+    target.innerHTML = samples.map(id =>
+      `<a href="javascript:void(0)" onclick="_openEventById(${id})">#${id}</a>`
+    ).join('');
+  }
+
+  // Populate the camera dropdown lazily on first load.
+  const cs = document.getElementById('r-camera');
+  if(cs.options.length <= 1){
+    for(const cam of Object.keys(t.by_camera || {})){
+      const o = document.createElement('option');
+      o.value = cam; o.textContent = cam;
+      cs.appendChild(o);
+    }
+  }
+}
+
+async function _openEventById(id){
+  // Fetch the row from the events API so the modal has a fully-shaped event.
+  try{
+    const r = await fetch(`/api/events?limit=1&offset=0&id=${id}`);
+    if(r.ok){
+      const data = await r.json();
+      const ev = (data.events || []).find(e => e.id === id);
+      if(ev){ openModal(ev); return; }
+    }
+    // Fallback: minimal stub so the modal at least renders headline + clip URL.
+    openModal({id, kind:'event', ts: Math.floor(Date.now()/1000), detail:{}});
+  } catch(_){
+    openModal({id, kind:'event', ts: Math.floor(Date.now()/1000), detail:{}});
+  }
+}
+
 // ── Render ────────────────────────────────────────────────────────────────────
 function renderKPIs(flash=false){
   const s=S.stats;
@@ -1001,6 +1212,14 @@ function escAttr(s){
   }[c]));
 }
 
+// Render a SHADOW pill if detail.shadow is true. Operators rely on this
+// to know an event reached the dashboard but did NOT page anyone.
+function _renderShadowPill(ev){
+  const det = ev.detail || {};
+  if(!det.shadow) return '';
+  return `<span class="shadow-pill" title="Shadow mode — not sent to Telegram">SHADOW</span>`;
+}
+
 function renderFeed(){
   const feed=document.getElementById('events-feed');
   const empty=document.getElementById('events-empty');
@@ -1027,11 +1246,13 @@ function renderFeed(){
     const action = ev.id != null ? S.actions[String(ev.id)] : null;
     const footer = _renderActionFooter(action);
     const buttons = ev.id != null && !action ? _renderActionButtons(ev.id) : '';
+    const shadowPill = _renderShadowPill(ev);
     return `<div class="ev-card${sevCls}" onclick='openModal(${esc(ev)})'>
       <div class="ev-bar" style="background:${sevMeta.color}"></div>
       <div class="ev-body">
         <div class="ev-top">
           <span class="badge ${m.cls}">${m.lbl}</span>
+          ${shadowPill}
           <span class="ev-cam">${cam}</span>
           <span class="ev-time">${t}</span>
         </div>
@@ -1065,7 +1286,7 @@ function renderHist(evts){
       <td class="mono dim">${ev.id}</td>
       <td class="mono">${timeTxt}</td>
       <td>${cam}</td>
-      <td><span class="badge ${m.cls}">${m.lbl}</span></td>
+      <td><span class="badge ${m.cls}">${m.lbl}</span> ${_renderShadowPill(ev)}</td>
       <td class="trunc sev-t-${sev}">${s||'<span style="color:var(--text3)">—</span>'}${actLine}</td>
       <td><button class="sb" onclick='openModal(${esc(ev)})'>view</button></td>
     </tr>`;
@@ -1706,13 +1927,18 @@ function zoneShowPopup(zone, clientX, clientY){
   const win  = zone.time_window || '*';
   const dw   = zone.dwell_s ? `, dwell ${zone.dwell_s}s` : '';
   const winText = win === '*' ? 'always' : win;
+  const nowS = Math.floor(Date.now() / 1000);
+  const shadowActive = Number(zone.shadow_until || 0) > nowS;
+  const shadowSuffix = shadowActive
+    ? ` · SHADOW ${Math.max(1, Math.round((zone.shadow_until - nowS) / 86400))}d`
+    : '';
   div.innerHTML =
     `<div class="zone-popup-name"></div>` +
     `<div class="hint" style="font-size:10px;color:var(--text3);margin-bottom:8px"></div>` +
     `<button type="button" class="edit-btn">Edit</button>` +
     `<button type="button">Delete</button>`;
   div.querySelector('.zone-popup-name').textContent = zone.name || ('Zone #' + zone.id);
-  div.querySelector('.hint').textContent = `${tier} · ${winText}${dw}`;
+  div.querySelector('.hint').textContent = `${tier} · ${winText}${dw}${shadowSuffix}`;
   div.querySelector('.edit-btn').addEventListener('click', () => {
     zoneClosePopup();
     zoneModalOpen({mode:'edit', zone:zone});
@@ -1806,12 +2032,47 @@ function zoneModalOpen(opts){
   document.getElementById('zone-f-window').value   = z.time_window || '*';
   document.getElementById('zone-f-roles').value    = (z.authorized_roles || []).join(', ');
 
+  // Shadow dropdown: pick the closest preset, fall through to custom.
+  const shadowSel = document.getElementById('zone-f-shadow');
+  const shadowCustom = document.getElementById('zone-f-shadow-custom');
+  const shadowHint = document.getElementById('zone-f-shadow-hint');
+  shadowCustom.style.display = 'none';
+  shadowCustom.value = '';
+  const su = Number(z.shadow_until || 0);
+  if(!su || su <= Math.floor(Date.now()/1000)){
+    shadowSel.value = '0';
+    shadowHint.style.color = 'var(--text3)';
+    shadowHint.textContent =
+      'While active, the zone fires events to the dashboard + audit log so you ' +
+      'can review what it would have flagged — but it never pages anyone. ' +
+      'Use it for the first 1-2 weeks after creating a zone to tune false alarms.';
+  } else {
+    shadowSel.value = 'custom';
+    const d = new Date(su * 1000);
+    const pad = n => String(n).padStart(2, '0');
+    shadowCustom.value =
+      `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ` +
+      `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    shadowCustom.style.display = '';
+    const days = Math.max(0, Math.round((su - Date.now()/1000) / 86400));
+    shadowHint.style.color = 'var(--accent)';
+    shadowHint.textContent = `Shadow mode active — ends in ~${days} day${days === 1 ? '' : 's'}.`;
+  }
+
   if(opts.mode === 'create'){
     zoneApplyTemplate(document.getElementById('zone-f-template').value);
   }
   document.getElementById('zone-modal-backdrop').classList.remove('hidden');
   setTimeout(()=>document.getElementById('zone-f-name').focus(), 50);
 }
+
+// Show/hide the custom expiry textbox when the operator picks "Custom expiry…".
+document.addEventListener('change', (e) => {
+  if(e.target && e.target.id === 'zone-f-shadow'){
+    const custom = document.getElementById('zone-f-shadow-custom');
+    custom.style.display = (e.target.value === 'custom') ? '' : 'none';
+  }
+});
 
 function zoneModalClose(){
   document.getElementById('zone-modal-backdrop').classList.add('hidden');
@@ -1827,6 +2088,33 @@ function _zoneCollectForm(){
   const roles = rolesRaw
     ? rolesRaw.split(',').map(s => s.trim()).filter(Boolean)
     : [];
+
+  // Shadow_until: 0 = off, otherwise epoch seconds when the window
+  // closes. Custom expiry is parsed in local time.
+  const shadowSelVal = document.getElementById('zone-f-shadow').value;
+  let shadow_until = 0;
+  if(shadowSelVal === '7' || shadowSelVal === '14'){
+    shadow_until = Math.floor(Date.now()/1000) + Number(shadowSelVal) * 86400;
+  } else if(shadowSelVal === 'custom'){
+    const txt = (document.getElementById('zone-f-shadow-custom').value || '').trim();
+    if(txt){
+      // Accepts "YYYY-MM-DD HH:MM" — Date treats this as local time on
+      // most browsers when there's no T separator; fall through to a
+      // tolerant parse that swaps in 'T' for safety.
+      const norm = txt.replace(' ', 'T');
+      const d = new Date(norm);
+      if(isNaN(d.getTime())){
+        alert('Custom shadow expiry must be YYYY-MM-DD HH:MM');
+        return null;
+      }
+      shadow_until = Math.floor(d.getTime() / 1000);
+      if(shadow_until <= Math.floor(Date.now()/1000)){
+        alert('Custom shadow expiry must be in the future');
+        return null;
+      }
+    }
+  }
+
   return {
     name,
     dwell_s:          parseFloat(document.getElementById('zone-f-dwell').value) || 0,
@@ -1834,6 +2122,7 @@ function _zoneCollectForm(){
     time_window:      (document.getElementById('zone-f-window').value || '*').trim() || '*',
     authorized_roles: roles,
     template_kind:    document.getElementById('zone-f-template').value,
+    shadow_until,
   };
 }
 
@@ -2002,28 +2291,38 @@ function initControls(){
   };
   document.getElementById('btn-export').onclick=exportCSV;
   document.getElementById('btn-export-json').onclick=exportJSON;
-  // Top-bar view tabs — Live ↔ History. Selection persists across reloads.
+  // Top-bar view tabs — Live ↔ History ↔ Reports. Selection persists.
   const showView = (name) => {
-    const live    = document.getElementById('view-live');
-    const history = document.getElementById('view-history');
-    const tLive   = document.getElementById('tab-live');
-    const tHist   = document.getElementById('tab-history');
-    const isHistory = name === 'history';
-    live.classList.toggle('hidden', isHistory);
-    history.classList.toggle('hidden', !isHistory);
-    tLive.classList.toggle('active', !isHistory);
-    tHist.classList.toggle('active',  isHistory);
-    tLive.setAttribute('aria-selected', String(!isHistory));
-    tHist.setAttribute('aria-selected', String( isHistory));
+    const views = {
+      live:    document.getElementById('view-live'),
+      history: document.getElementById('view-history'),
+      reports: document.getElementById('view-reports'),
+    };
+    const tabs = {
+      live:    document.getElementById('tab-live'),
+      history: document.getElementById('tab-history'),
+      reports: document.getElementById('tab-reports'),
+    };
+    if(!views[name]) name = 'live';
+    for(const k of Object.keys(views)){
+      views[k].classList.toggle('hidden', k !== name);
+      tabs[k].classList.toggle('active',  k === name);
+      tabs[k].setAttribute('aria-selected', String(k === name));
+    }
     try { localStorage.setItem('sentinel.view', name); } catch {}
-    if (isHistory) fetchHist();
+    if (name === 'history') fetchHist();
+    if (name === 'reports') fetchReport();
   };
   document.getElementById('tab-live').onclick    = () => showView('live');
   document.getElementById('tab-history').onclick = () => showView('history');
+  document.getElementById('tab-reports').onclick = () => showView('reports');
   try {
     const saved = localStorage.getItem('sentinel.view');
-    if (saved === 'history') showView('history');
+    if (saved === 'history' || saved === 'reports') showView(saved);
   } catch {}
+  document.getElementById('r-refresh').onclick = fetchReport;
+  document.getElementById('r-days').onchange   = fetchReport;
+  document.getElementById('r-camera').onchange = fetchReport;
   document.addEventListener('keydown',e=>{
     const m = document.getElementById('modal');
     const modalOpen = m && !m.classList.contains('hidden');
@@ -2173,6 +2472,22 @@ document.addEventListener('DOMContentLoaded',()=>{
     <label>Authorized roles (comma-separated)
       <input type="text" id="zone-f-roles" placeholder="e.g. supervisor, hazmat" />
       <div class="hint">Phase 2 — stored now, applied once badge / vest detection lands.</div>
+    </label>
+
+    <label>Shadow mode (no Telegram, dashboard-only)
+      <select id="zone-f-shadow">
+        <option value="0">Off — fire normally</option>
+        <option value="7">7 days</option>
+        <option value="14">14 days (recommended for new zones)</option>
+        <option value="custom">Custom expiry…</option>
+      </select>
+      <input type="text" id="zone-f-shadow-custom" placeholder="YYYY-MM-DD HH:MM (local)"
+             style="display:none;margin-top:6px" />
+      <div class="hint" id="zone-f-shadow-hint">
+        While active, the zone fires events to the dashboard + audit log so you
+        can review what it would have flagged — but it never pages anyone.
+        Use it for the first 1-2 weeks after creating a zone to tune false alarms.
+      </div>
     </label>
 
     <div class="zone-modal-acts">

@@ -1995,6 +1995,14 @@ def emit_alert(camera_id: str, kind: str, detail: dict) -> None:
     ):
         decision_route = "dashboard"
 
+    # Phase 3 — shadow mode. The forbidden-zone rule stamps detail.shadow
+    # when a zone is in its post-deploy shake-down window. Force the
+    # route to "dashboard" so events show up in the live feed + history
+    # for review but never page anyone via Telegram, regardless of
+    # severity. Dedup still applies so the shadow stream isn't noisy.
+    if detail.get("shadow") and decision_route == "telegram":
+        decision_route = "dashboard"
+
     # Suppressed by threshold table — no events row, no Telegram, audit only.
     if decision_route == "suppressed":
         _audit_write(
@@ -2379,7 +2387,8 @@ class ForbiddenZoneEngine:
             "       COALESCE(severity_tier, 'CRITICAL') AS severity_tier, "
             "       COALESCE(time_window, '*')          AS time_window, "
             "       COALESCE(authorized_roles, '[]')    AS authorized_roles, "
-            "       COALESCE(template_kind, 'custom')   AS template_kind "
+            "       COALESCE(template_kind, 'custom')   AS template_kind, "
+            "       COALESCE(shadow_until, 0)           AS shadow_until "
             "FROM forbidden_zones ORDER BY id"
         )
         try:
@@ -2407,6 +2416,7 @@ class ForbiddenZoneEngine:
                         "time_window":      str(row[5]) or "*",
                         "authorized_roles": roles,
                         "template_kind":    str(row[8]),
+                        "shadow_until":     int(row[9] or 0),
                     })
                 except Exception as e:
                     log.warning(
@@ -2435,7 +2445,7 @@ class ForbiddenZoneEngine:
                                 "id": int(row[0]), "name": str(row[1]), "poly": poly,
                                 "dwell_s": 0.0, "severity_tier": "CRITICAL",
                                 "time_window": "*", "authorized_roles": [],
-                                "template_kind": "custom",
+                                "template_kind": "custom", "shadow_until": 0,
                             })
                     except Exception:
                         continue

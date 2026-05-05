@@ -73,6 +73,10 @@ _FZ_PHASE1_COLUMNS = (
     ("time_window",      "TEXT    NOT NULL DEFAULT '*'"),
     ("authorized_roles", "TEXT    NOT NULL DEFAULT '[]'"),
     ("template_kind",    "TEXT    NOT NULL DEFAULT 'custom'"),
+    # Phase 3: shadow mode. Epoch seconds; 0 = off, otherwise the zone
+    # is in shadow mode until this timestamp (events fire to dashboard
+    # + audit, never to Telegram, regardless of severity).
+    ("shadow_until",     "INTEGER NOT NULL DEFAULT 0"),
 )
 
 
@@ -524,6 +528,7 @@ class ZoneCreate(BaseModel):
     time_window: str = "*"
     authorized_roles: list = Field(default_factory=list)
     template_kind: str = "custom"
+    shadow_until: int = Field(default=0, ge=0)
 
 
 class ZoneUpdate(BaseModel):
@@ -535,6 +540,7 @@ class ZoneUpdate(BaseModel):
     time_window: Optional[str] = None
     authorized_roles: Optional[list] = None
     template_kind: Optional[str] = None
+    shadow_until: Optional[int] = Field(default=None, ge=0)
 
 
 def _validate_polygon(polygon) -> str:
@@ -629,12 +635,14 @@ def _row_to_zone(row) -> dict:
         "time_window":      str(_g("time_window", "*") or "*"),
         "authorized_roles": roles,
         "template_kind":    str(_g("template_kind", "custom") or "custom"),
+        "shadow_until":     int(_g("shadow_until", 0) or 0),
     }
 
 
 _ZONE_COLS = (
     "id, name, polygon, created_at, updated_at, "
-    "dwell_s, severity_tier, time_window, authorized_roles, template_kind"
+    "dwell_s, severity_tier, time_window, authorized_roles, template_kind, "
+    "shadow_until"
 )
 
 
@@ -665,10 +673,12 @@ def api_zones_create(payload: ZoneCreate):
         cur = c.execute(
             "INSERT INTO forbidden_zones "
             "(name, polygon, created_at, updated_at, "
-            " dwell_s, severity_tier, time_window, authorized_roles, template_kind) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " dwell_s, severity_tier, time_window, authorized_roles, template_kind, "
+            " shadow_until) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (name, poly_json, now, now,
-             float(payload.dwell_s), severity, time_window, roles, template),
+             float(payload.dwell_s), severity, time_window, roles, template,
+             int(payload.shadow_until)),
         )
         row_id = cur.lastrowid
         c.commit()
@@ -706,6 +716,8 @@ def api_zones_update(zone_id: int, payload: ZoneUpdate):
         sets.append("authorized_roles=?"); args.append(_validate_roles(payload.authorized_roles))
     if payload.template_kind is not None:
         sets.append("template_kind=?"); args.append(_validate_template_kind(payload.template_kind))
+    if payload.shadow_until is not None:
+        sets.append("shadow_until=?"); args.append(int(payload.shadow_until))
     if not sets:
         raise HTTPException(status_code=400, detail="no fields to update")
     sets.append("updated_at=?"); args.append(int(time.time()))
@@ -936,6 +948,168 @@ def api_stats():
     stats["uptime_s"]       = int(time.time() - _start_ts)
     stats["stream_port"]    = STREAM_PORT
     return stats
+
+
+def _detail_dict(raw) -> dict:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            d = json.loads(raw)
+            return d if isinstance(d, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+@app.get("/api/reports/weekly")
+def api_reports_weekly(
+    days: int = Query(default=7, ge=1, le=90),
+    camera: Optional[str] = None,
+    sample_limit: int = Query(default=20, ge=0, le=200),
+):
+    """Aggregated rollup for the operator's weekly review (Phase 3).
+
+    Defaults to a 7-day window. Returns:
+      * window: {since, until, days}
+      * totals: events, by_kind, by_camera
+      * shadow: how many events were shadow-only (no Telegram)
+      * after_hours: how many forbidden_zone events fired during a
+                     time_window match outside business hours (best-effort
+                     since we don't store mode per event — we use the
+                     stamped ``detail.severity`` ladder that's already
+                     mode-aware as a coarse proxy)
+      * by_zone: forbidden_zone breakdown by zone name
+      * fp: {by_camera, total, over_budget_per_camera_per_week}
+      * sample_event_ids: most-recent ids the operator can spot-check
+                          via the modal/clip player
+    """
+    until = int(time.time())
+    since = until - days * 86400
+    args_e: list = [since, until]
+    cam_clause = ""
+    if camera:
+        cam_clause = " AND camera=?"
+        args_e.append(camera)
+
+    with _db_lock:
+        c = _conn()
+
+        total = c.execute(
+            f"SELECT COUNT(*) FROM events WHERE ts>=? AND ts<=?{cam_clause}",
+            args_e,
+        ).fetchone()[0]
+
+        by_kind = {
+            r["kind"]: r["c"]
+            for r in c.execute(
+                f"SELECT kind, COUNT(*) c FROM events "
+                f"WHERE ts>=? AND ts<=?{cam_clause} GROUP BY kind ORDER BY c DESC",
+                args_e,
+            )
+        }
+        by_camera = {
+            r["camera"]: r["c"]
+            for r in c.execute(
+                f"SELECT camera, COUNT(*) c FROM events "
+                f"WHERE ts>=? AND ts<=?{cam_clause} GROUP BY camera ORDER BY c DESC",
+                args_e,
+            )
+        }
+
+        # Walk forbidden_zone rows once to build zone + shadow + after-hours
+        # counters. detail.shadow is a per-event flag; detail.zone is the
+        # human zone name; ts is the event-fire time for the after-hours
+        # bucket (0:00–6:00 or 18:00–24:00 local — coarse but useful).
+        zone_rows = c.execute(
+            f"SELECT ts, detail FROM events WHERE kind='forbidden_zone' "
+            f"AND ts>=? AND ts<=?{cam_clause}",
+            args_e,
+        ).fetchall()
+        by_zone: dict = {}
+        shadow_count = 0
+        after_hours = 0
+        for r in zone_rows:
+            d = _detail_dict(r["detail"])
+            zname = str(d.get("zone") or d.get("zone_name") or "—")
+            by_zone[zname] = by_zone.get(zname, 0) + 1
+            if d.get("shadow"):
+                shadow_count += 1
+            try:
+                hr = datetime.datetime.fromtimestamp(float(r["ts"])).hour
+                if hr < 6 or hr >= 18:
+                    after_hours += 1
+            except Exception:
+                pass
+
+        # FP rate by camera (false_alarm actions joined back to events).
+        fp_rows = c.execute(
+            f"SELECT e.camera AS camera, COUNT(*) AS c "
+            f"FROM event_actions ea JOIN events e ON e.id=ea.event_id "
+            f"WHERE ea.action='false_alarm' AND ea.ts>=? AND ea.ts<=?"
+            + (f" AND e.camera=?" if camera else "") +
+            f" GROUP BY e.camera",
+            args_e,
+        ).fetchall() if True else []
+        try:
+            fp_by_camera = {r["camera"]: r["c"] for r in fp_rows}
+        except sqlite3.OperationalError:
+            fp_by_camera = {}
+
+        # Sample event ids — most recent, weighted toward forbidden_zone
+        # so the operator's spot-check covers what the spec actually
+        # cares about. Falls back to "any recent event" when there are
+        # too few zone events.
+        sample_ids: list = []
+        if sample_limit > 0:
+            zone_ids = [
+                r["id"] for r in c.execute(
+                    f"SELECT id FROM events WHERE kind='forbidden_zone' "
+                    f"AND ts>=? AND ts<=?{cam_clause} ORDER BY ts DESC LIMIT ?",
+                    args_e + [sample_limit],
+                )
+            ]
+            sample_ids.extend(zone_ids)
+            if len(sample_ids) < sample_limit:
+                pad = sample_limit - len(sample_ids)
+                rest_ids = [
+                    r["id"] for r in c.execute(
+                        f"SELECT id FROM events "
+                        f"WHERE ts>=? AND ts<=?{cam_clause} "
+                        f"AND kind!='forbidden_zone' ORDER BY ts DESC LIMIT ?",
+                        args_e + [pad],
+                    )
+                ]
+                sample_ids.extend(rest_ids)
+
+        c.close()
+
+    weeks = max(days / 7.0, 1.0 / 7.0)  # avoid /0
+    fp_per_camera_per_week = {
+        cam: round(n / weeks, 2) for cam, n in fp_by_camera.items()
+    }
+    fp_over_budget = {
+        cam: rate > 2.0 for cam, rate in fp_per_camera_per_week.items()
+    }
+
+    return {
+        "window": {"since": since, "until": until, "days": days},
+        "totals": {
+            "events":     total,
+            "by_kind":    by_kind,
+            "by_camera":  by_camera,
+        },
+        "shadow":      {"count": shadow_count},
+        "after_hours": {"count": after_hours},
+        "by_zone":     by_zone,
+        "fp": {
+            "by_camera":                  fp_by_camera,
+            "per_camera_per_week":        fp_per_camera_per_week,
+            "over_budget_per_camera":     fp_over_budget,
+            "budget":                     2.0,
+        },
+        "sample_event_ids": sample_ids,
+    }
 
 
 @app.get("/api/status")
