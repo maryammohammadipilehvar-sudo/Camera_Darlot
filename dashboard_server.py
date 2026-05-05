@@ -17,6 +17,7 @@ import datetime
 import json
 import logging
 import os
+import re
 import socket
 import sqlite3
 import threading
@@ -138,6 +139,15 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_zr_zone_hour ON zone_rejections(zone_id, hour);
             CREATE UNIQUE INDEX IF NOT EXISTS idx_zr_source ON zone_rejections(source_event_id);
+            CREATE TABLE IF NOT EXISTS role_colors (
+                role         TEXT    PRIMARY KEY,
+                hex_color    TEXT    NOT NULL,
+                hue_tol_deg  INTEGER NOT NULL DEFAULT 15,
+                sat_min      INTEGER NOT NULL DEFAULT 80,
+                val_min      INTEGER NOT NULL DEFAULT 60,
+                pixel_frac   REAL    NOT NULL DEFAULT 0.25,
+                updated_at   INTEGER NOT NULL
+            );
         """)
         _migrate_forbidden_zones(c)
         c.commit()
@@ -816,6 +826,98 @@ def api_zones_delete(zone_id: int):
     if not deleted:
         raise HTTPException(status_code=404, detail="zone not found")
     log.info(f"forbidden_zone deleted id={zone_id}")
+    return Response(status_code=204)
+
+
+# ── Role colours (vest-based authorization, Option A) ────────────────────────
+
+_HEX_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
+
+
+class RoleColorUpsert(BaseModel):
+    role: str = Field(..., min_length=1, max_length=64)
+    hex_color: str = Field(..., min_length=4, max_length=9)
+    hue_tol_deg: int = Field(default=15, ge=2, le=60)
+    sat_min: int = Field(default=80, ge=0, le=255)
+    val_min: int = Field(default=60, ge=0, le=255)
+    pixel_frac: float = Field(default=0.25, ge=0.05, le=1.0)
+
+
+def _row_to_role(row) -> dict:
+    return {
+        "role":        row["role"],
+        "hex_color":   row["hex_color"],
+        "hue_tol_deg": int(row["hue_tol_deg"]),
+        "sat_min":     int(row["sat_min"]),
+        "val_min":     int(row["val_min"]),
+        "pixel_frac":  float(row["pixel_frac"]),
+        "updated_at":  int(row["updated_at"]),
+    }
+
+
+@app.get("/api/roles")
+def api_roles_list():
+    """Return every configured role colour. Used by the engine's reload
+    thread (so 5s after a write the rule sees the change) and the
+    dashboard's role-management modal."""
+    with _db_lock:
+        c = _conn()
+        try:
+            rows = c.execute(
+                "SELECT role, hex_color, hue_tol_deg, sat_min, val_min, "
+                "pixel_frac, updated_at FROM role_colors ORDER BY role"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            rows = []
+        c.close()
+    return {"roles": [_row_to_role(r) for r in rows]}
+
+
+@app.post("/api/roles", status_code=201)
+def api_roles_upsert(payload: RoleColorUpsert):
+    """Create or update a role's vest-colour reference (idempotent by name)."""
+    role = payload.role.strip()
+    hex_color = payload.hex_color.strip().upper()
+    if not _HEX_RE.match(hex_color):
+        raise HTTPException(status_code=400, detail="hex_color must be #RRGGBB")
+    now = int(time.time())
+    with _db_lock:
+        c = _conn()
+        c.execute(
+            "INSERT OR REPLACE INTO role_colors "
+            "(role, hex_color, hue_tol_deg, sat_min, val_min, pixel_frac, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (role, hex_color, payload.hue_tol_deg, payload.sat_min,
+             payload.val_min, payload.pixel_frac, now),
+        )
+        # Bump every zone's updated_at so the engine notices the role
+        # change on its next 5s reload (the ForbiddenZoneEngine watches
+        # forbidden_zones.updated_at, not role_colors).
+        c.execute("UPDATE forbidden_zones SET updated_at=? WHERE 1", (now,))
+        c.commit()
+        row = c.execute(
+            "SELECT role, hex_color, hue_tol_deg, sat_min, val_min, "
+            "pixel_frac, updated_at FROM role_colors WHERE role=?",
+            (role,),
+        ).fetchone()
+        c.close()
+    log.info(f"role_color upsert role={role!r} hex={hex_color}")
+    return _row_to_role(row)
+
+
+@app.delete("/api/roles/{role}", status_code=204)
+def api_roles_delete(role: str):
+    now = int(time.time())
+    with _db_lock:
+        c = _conn()
+        cur = c.execute("DELETE FROM role_colors WHERE role=?", (role,))
+        if cur.rowcount == 0:
+            c.close()
+            raise HTTPException(status_code=404, detail="role not found")
+        c.execute("UPDATE forbidden_zones SET updated_at=? WHERE 1", (now,))
+        c.commit()
+        c.close()
+    log.info(f"role_color deleted role={role!r}")
     return Response(status_code=204)
 
 

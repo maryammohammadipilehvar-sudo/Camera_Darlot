@@ -2351,6 +2351,11 @@ class ForbiddenZoneEngine:
         # more than a few hundred rows in normal use).
         self._rejections: list = []
         self._rejection_radius_px = int(rejection_radius_px)
+        # Vest-colour authorization (Option A). {role: {hue_cv, sat_min,
+        # val_min, pixel_frac, hue_tol_cv}} — hue values are pre-converted
+        # to OpenCV's 0..180 scale at load so the rule's per-frame work
+        # is just a vectorised mask + count.
+        self._role_colors: dict = {}
         self._last_meta: tuple = (-1, -1)  # (count, max_updated_at)
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -2483,12 +2488,51 @@ class ForbiddenZoneEngine:
         except Exception as e:
             log.warning("FORBIDDEN_ZONE: rejection reload failed: %s", e)
 
+        # Vest-colour role table (Option A authorization). Hex → HSV
+        # converted up-front so the per-frame check is vectorised.
+        new_roles: dict = {}
+        try:
+            for row in self._conn.execute(
+                "SELECT role, hex_color, hue_tol_deg, sat_min, val_min, pixel_frac "
+                "FROM role_colors"
+            ):
+                try:
+                    hex_color = str(row[1]).lstrip("#")
+                    if len(hex_color) != 6:
+                        continue
+                    r = int(hex_color[0:2], 16)
+                    g = int(hex_color[2:4], 16)
+                    b = int(hex_color[4:6], 16)
+                    # OpenCV reads BGR, hue in 0..180.
+                    bgr_pixel = np.uint8([[[b, g, r]]])
+                    hsv_pixel = cv2.cvtColor(bgr_pixel, cv2.COLOR_BGR2HSV)[0, 0]
+                    hue_cv = int(hsv_pixel[0])
+                    new_roles[str(row[0])] = {
+                        "hue_cv":     hue_cv,
+                        # OpenCV hue range is 0..180, so halve the
+                        # operator's degree-based tolerance.
+                        "hue_tol_cv": max(1, int(int(row[2]) / 2)),
+                        "sat_min":    int(row[3]),
+                        "val_min":    int(row[4]),
+                        "pixel_frac": float(row[5]),
+                    }
+                except Exception as e:
+                    log.warning(
+                        "FORBIDDEN_ZONE: skipping malformed role colour %s: %s",
+                        row[0], e,
+                    )
+        except sqlite3.OperationalError:
+            pass  # table doesn't exist yet
+        except Exception as e:
+            log.warning("FORBIDDEN_ZONE: role_colors load failed: %s", e)
+
         with self._lock:
             self._zones = new
             self._rejections = new_rej
+            self._role_colors = new_roles
         log.info(
-            "FORBIDDEN_ZONE reloaded: %d zone(s), %d rejection(s)",
-            len(new), len(new_rej),
+            "FORBIDDEN_ZONE reloaded: %d zone(s), %d rejection(s), %d role colour(s)",
+            len(new), len(new_rej), len(new_roles),
         )
 
     def start_reload_thread(self, interval_s: float = 5.0) -> None:
@@ -2522,6 +2566,71 @@ class ForbiddenZoneEngine:
             if cv2.pointPolygonTest(z["poly"], (cx, cy), False) >= 0:
                 return z
         return None
+
+    def get_role_colors(self) -> dict:
+        """Return a snapshot of the current role-colour table (Option A)."""
+        with self._lock:
+            return dict(self._role_colors)
+
+    def check_authorized(
+        self, frame, bbox: "tuple[int,int,int,int]",
+        authorized_roles: "list[str]",
+    ) -> bool:
+        """Return True when the person's upper-torso colour matches any
+        authorized role's reference vest colour (Option A — vest-based
+        authorization). Returns False on any degraded path so the rule
+        falls through to a normal alert.
+
+        Crops the upper torso (top 15-55% of bbox, central 80% horizontal),
+        converts to HSV, and counts pixels whose hue is within ``hue_tol_cv``
+        of the role's reference hue while saturation/value clear their
+        floors. If the matched fraction exceeds the role's ``pixel_frac``,
+        the person is treated as authorized.
+        """
+        if frame is None or not authorized_roles:
+            return False
+        with self._lock:
+            colors = {r: self._role_colors[r] for r in authorized_roles
+                      if r in self._role_colors}
+        if not colors:
+            return False
+        try:
+            x1, y1, x2, y2 = (int(v) for v in bbox)
+            bw = x2 - x1
+            bh = y2 - y1
+            if bw < 10 or bh < 20:
+                return False
+            cy1 = y1 + int(bh * 0.15)
+            cy2 = y1 + int(bh * 0.55)
+            cx1 = x1 + int(bw * 0.10)
+            cx2 = x2 - int(bw * 0.10)
+            fh, fw = frame.shape[:2]
+            cy1 = max(0, min(fh, cy1)); cy2 = max(0, min(fh, cy2))
+            cx1 = max(0, min(fw, cx1)); cx2 = max(0, min(fw, cx2))
+            if cy2 <= cy1 or cx2 <= cx1:
+                return False
+            crop = frame[cy1:cy2, cx1:cx2]
+            if crop.size == 0:
+                return False
+            hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+            h = hsv[..., 0].astype(np.int16)
+            s = hsv[..., 1]
+            v = hsv[..., 2]
+            total = h.size
+            for cfg in colors.values():
+                # OpenCV hue is circular in [0, 180); use modular distance.
+                d = np.abs(h - cfg["hue_cv"])
+                d = np.minimum(d, 180 - d)
+                mask = (
+                    (d <= cfg["hue_tol_cv"]) &
+                    (s >= cfg["sat_min"]) &
+                    (v >= cfg["val_min"])
+                )
+                if (mask.sum() / total) >= cfg["pixel_frac"]:
+                    return True
+        except Exception as e:
+            log.debug("FORBIDDEN_ZONE vest check failed: %s", e)
+        return False
 
     def check_rejection(self, zone_id: int, cx: int, cy: int, hour: int) -> bool:
         """Return True when this hit is suppressed by a learned rejection.

@@ -140,6 +140,18 @@ class ForbiddenZoneRule(Rule):
             check_rej = getattr(self.engine, "check_rejection", None)
             if callable(check_rej) and check_rej(zone_id, t.cx, t.cy, now_hour):
                 continue
+            # Vest-colour authorization (Option A). If this zone has
+            # authorized_roles configured AND the operator has set up
+            # role colours, run the cheap HSV check against the
+            # person's upper torso. A match means "authorized — don't
+            # fire". Falls through (returns False) when ctx.frame is
+            # None or no role colour is configured for the zone's roles.
+            authorized_roles = zone.get("authorized_roles", []) or []
+            check_auth = getattr(self.engine, "check_authorized", None)
+            if (authorized_roles and ctx.frame is not None and
+                    callable(check_auth) and
+                    check_auth(ctx.frame, t.bbox, authorized_roles)):
+                continue
             tid = t.track_id if t.track_id >= 0 else -1
             key = (tid, zone_id)
             alive_keys.add(key)
