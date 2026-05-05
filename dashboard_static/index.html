@@ -1040,14 +1040,21 @@ async function fetchReport(){
   const cam  = document.getElementById('r-camera').value;
   const url  = `/api/reports/weekly?days=${encodeURIComponent(days)}` +
                (cam ? `&camera=${encodeURIComponent(cam)}` : '');
+  // Visual feedback so the operator sees that clicking Refresh did
+  // something even when the underlying data is unchanged.
+  const win = document.getElementById('r-window');
+  const btn = document.getElementById('r-refresh');
+  if(win) win.textContent = 'Refreshing…';
+  if(btn){ btn.disabled = true; btn.textContent = 'Refreshing…'; }
   try{
     const r = await fetch(url);
     if(!r.ok) throw new Error('http ' + r.status);
     const data = await r.json();
     renderReport(data);
   } catch(e){
-    document.getElementById('r-window').textContent =
-      'Failed to load report: ' + e.message;
+    if(win) win.textContent = 'Failed to load report: ' + e.message;
+  } finally {
+    if(btn){ btn.disabled = false; btn.textContent = 'Refresh'; }
   }
 }
 
@@ -1084,10 +1091,17 @@ function renderReport(data){
   const fp = data.fp || {by_camera:{}, per_camera_per_week:{}, over_budget_per_camera:{}};
   const fpTotal = Object.values(fp.by_camera || {}).reduce((a,b) => a + b, 0);
   const overBudget = Object.values(fp.over_budget_per_camera || {}).some(Boolean);
-  const zonesNow = data.zones_configured ?? 0;
+  // If the server is older than the report-fix commit it won't ship
+  // zones_configured. Showing "0 — no zones drawn" in that case would
+  // be wrong, so render "—" until the dashboard is restarted.
+  const zonesNow = data.zones_configured;
+  const zonesTile = zonesNow == null
+    ? _rTile('Zones configured', '—', 'restart dashboard to enable')
+    : _rTile('Zones configured', zonesNow,
+             zonesNow === 0 ? 'no zones drawn yet' : 'in this site',
+             zonesNow === 0 ? 'r-bad' : 'r-good');
   const tiles = [
-    _rTile('Zones configured', zonesNow, zonesNow === 0 ? 'no zones drawn yet' : 'in this site',
-           zonesNow === 0 ? 'r-bad' : 'r-good'),
+    zonesTile,
     _rTile('Total events',  t.events ?? 0),
     _rTile('Shadow events', sh.count, 'reached dashboard, did NOT page'),
     _rTile('After-hours',   ah.count, 'forbidden_zone, 18:00–06:00'),
@@ -1104,8 +1118,12 @@ function renderReport(data){
     'No events in window');
 
   // Split zone breakdown so the operator sees current vs historical.
-  const activeZ  = data.by_zone_active  || {};
-  const deletedZ = data.by_zone_deleted || {};
+  // Fall back to the merged `by_zone` field when the server hasn't been
+  // restarted yet to pick up the active/deleted split — keeps the
+  // dashboard usable during half-deployed states.
+  const hasSplit = data.by_zone_active != null || data.by_zone_deleted != null;
+  const activeZ  = hasSplit ? (data.by_zone_active  || {}) : (data.by_zone || {});
+  const deletedZ = hasSplit ? (data.by_zone_deleted || {}) : {};
   const activeRows  = Object.entries(activeZ).map(([k,v]) => [k, v]);
   const deletedRows = Object.entries(deletedZ).map(([k,v]) => [k, v]);
   _rFillTable('#r-byzone-active',  activeRows,
