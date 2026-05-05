@@ -685,6 +685,7 @@ const KIND = {
   anomaly:    { c:'var(--red)',    cls:'b-red',     lbl:'ANOM' },
   zone_dwell: { c:'var(--purple)', cls:'b-purple',  lbl:'ZONE' },
   audio:      { c:'var(--teal)',   cls:'b-teal',    lbl:'AUD'  },
+  dog:        { c:'var(--teal)',   cls:'b-teal',    lbl:'DOG'  },
 };
 
 function km(kind){return KIND[kind]||{c:'var(--text3)',cls:'b-grey',lbl:(kind||'UNK').toUpperCase().slice(0,4)}}
@@ -746,6 +747,11 @@ function summary(ev){
     const tid = det.track_id;
     if(typeof tid === 'number' && tid >= 0) return `Phone use — Person #${tid}`;
     return 'Phone use detected';
+  }
+  if(ev.kind==='dog'){
+    const tid = det.track_id;
+    if(typeof tid === 'number' && tid >= 0) return `Dog detected — #${tid}`;
+    return 'Dog detected';
   }
   return ev.kind || 'event';
 }
@@ -1041,6 +1047,7 @@ function severityOf(ev){
   }
   if(kind === 'loitering') return 'high';
   if(kind === 'phone_use') return 'low';
+  if(kind === 'dog') return 'low';
   if(kind === 'detection') return 'medium';
   if(kind === 'detection_summary' || kind === 'face_match' ||
      kind === 'behavior') return 'low';
@@ -1066,6 +1073,7 @@ const KIND_HUMAN = {
   burst_summary:     'Multiple events',
   forbidden_zone:    'Forbidden zone',
   phone_use:         'Phone use',
+  dog:               'Dog detected',
 };
 
 // Format an event ts (seconds since epoch) for the modal facts list.

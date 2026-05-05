@@ -240,6 +240,13 @@ def format_event_for_ui(event: dict) -> dict:
         else:
             summary = "Phone use detected"
 
+    elif kind == "dog":
+        tid = detail.get("track_id")
+        if isinstance(tid, int) and tid >= 0:
+            summary = f"Dog detected — #{tid}"
+        else:
+            summary = "Dog detected"
+
     event["detail"] = detail
     event["display_time"] = display_time
     event["display_short_time"] = short_time

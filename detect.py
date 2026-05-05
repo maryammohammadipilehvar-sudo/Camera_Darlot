@@ -196,6 +196,11 @@ CFG = {
         # OCCUPIED/CLOSED (still telegram); MAINTENANCE upgrades from
         # suppressed → dashboard so it's visible during maintenance windows.
         "phone_use":          {"OCCUPIED": "HIGH",     "CLOSED": "HIGH",     "MAINTENANCE": "LOW"},
+        # Dog detected — first-class kind so the operator gets a per-track
+        # alert without unmuting the noisy generic "detection" stream. LOW
+        # daytime (dashboard-only), MEDIUM after-hours (telegram), INFO
+        # during maintenance.
+        "dog":                {"OCCUPIED": "LOW",      "CLOSED": "MEDIUM",   "MAINTENANCE": "INFO"},
     },
 
     # ── Notification thresholds (Session 5) ───────────────────────
@@ -223,7 +228,7 @@ CFG = {
     # backward compat — translates to ["forbidden_zone"] at startup
     # with a one-time deprecation log line. Mixing both raises at
     # import time so misconfigurations are loud, not subtle.
-    "alert_kind_allowlist": ["forbidden_zone", "phone_use", "predicted_intrusion"],
+    "alert_kind_allowlist": ["forbidden_zone", "phone_use", "predicted_intrusion", "dog"],
 
     # ── Phone-use detection ────────────────────────────────────────
     # phone_use_containment is the PRODUCTION metric: fraction of the
@@ -2814,6 +2819,19 @@ def run(cfg: dict):
                     # Cell-phone detections feed phone_use only — no
                     # standalone "1 cell phone detected" events.
                     if cls == 67:
+                        continue
+
+                    # Dog (COCO 16) → dedicated "dog" event kind. Parallel
+                    # to phone_use: keeps dogs out of the noisy generic
+                    # "detection" stream and gives them their own severity,
+                    # dedup window, and dashboard treatment.
+                    if cls == 16:
+                        emit_alert(cfg["camera_id"], "dog", {
+                            "track_id":   track_id if track_id >= 0 else None,
+                            "confidence": round(conf, 3),
+                            "bbox":       bbox,
+                            "label":      "Dog detected",
+                        })
                         continue
 
                     # Forbidden-zone moved to ForbiddenZoneRule (Phase 1b);
