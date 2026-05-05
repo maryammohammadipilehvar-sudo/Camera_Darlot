@@ -2119,6 +2119,54 @@ async function rolesDelete(role){
   if(!r.ok) throw new Error('Delete failed: http ' + r.status);
 }
 
+// Common warehouse role presets — colour values are typical hi-vis
+// shades. The operator can edit any swatch after adding via the
+// per-row colour picker. Order is rough frequency (most warehouses
+// have a supervisor + forklift combo first).
+const ROLE_PRESETS = [
+  {role: 'supervisor',     hex: '#FF6A00', label: 'Supervisor (orange)'},
+  {role: 'forklift_op',    hex: '#FFD400', label: 'Forklift operator (yellow)'},
+  {role: 'safety_officer', hex: '#9DFF00', label: 'Safety officer (lime)'},
+  {role: 'hazmat',         hex: '#E11A1A', label: 'Hazmat (red)'},
+  {role: 'maintenance',    hex: '#1E78FF', label: 'Maintenance (blue)'},
+  {role: 'visitor',        hex: '#00C28A', label: 'Visitor (green)'},
+  {role: 'security',       hex: '#1A1A1A', label: 'Security (black)'},
+  {role: 'picker',         hex: '#FF9F00', label: 'Picker / loader (amber)'},
+];
+
+function rolesRenderPresets(existingRoles){
+  const wrap = document.getElementById('roles-presets');
+  if(!wrap) return;
+  const have = new Set(existingRoles.map(r => r.role));
+  wrap.innerHTML = ROLE_PRESETS.map(p => {
+    const already = have.has(p.role);
+    return `<button type="button" data-role="${escAttr(p.role)}"
+              data-hex="${escAttr(p.hex)}"
+              ${already ? 'disabled' : ''}
+              onclick="rolesAddPreset(this)"
+              title="${already ? 'Already added' : 'Click to add'}"
+              style="display:inline-flex;align-items:center;gap:8px;
+                     padding:6px 10px 6px 8px;border-radius:4px;
+                     border:1px solid var(--border2);background:var(--bg);
+                     color:var(--text);font-size:12.5px;cursor:pointer;
+                     ${already ? 'opacity:.45;cursor:default' : ''}">
+      <span style="display:inline-block;width:14px;height:14px;border-radius:3px;
+                   background:${escAttr(p.hex)};border:1px solid rgba(0,0,0,.3)"></span>
+      ${escAttr(p.label)}${already ? ' ✓' : ''}
+    </button>`;
+  }).join('');
+}
+
+async function rolesAddPreset(btn){
+  if(btn.disabled) return;
+  const role = btn.dataset.role;
+  const hex  = btn.dataset.hex;
+  try{
+    await rolesUpsert({role, hex_color: hex});
+    rolesRefresh();
+  } catch(e){ alert(e.message); }
+}
+
 function rolesModalOpen(){
   document.getElementById('roles-modal-backdrop').classList.remove('hidden');
   rolesRefresh();
@@ -2131,8 +2179,9 @@ async function rolesRefresh(){
   tb.innerHTML = '<tr><td colspan="4" style="padding:14px 6px;color:var(--text2);font-style:italic">Loading…</td></tr>';
   try{
     const roles = await rolesFetch();
+    rolesRenderPresets(roles);
     if(!roles.length){
-      tb.innerHTML = '<tr><td colspan="4" style="padding:14px 6px;color:var(--text2);font-style:italic">No roles configured yet — add one below.</td></tr>';
+      tb.innerHTML = '<tr><td colspan="4" style="padding:14px 6px;color:var(--text2);font-style:italic">No roles configured yet — pick a preset above or add a custom one below.</td></tr>';
       return;
     }
     tb.innerHTML = roles.map(r =>
@@ -2815,11 +2864,21 @@ document.addEventListener('DOMContentLoaded',()=>{
     </table>
 
     <div style="margin-top:18px;padding-top:14px;border-top:1px solid var(--border)">
-      <div style="font-size:13px;font-weight:600;margin-bottom:8px;color:var(--text)">Add role</div>
+      <div style="font-size:13px;font-weight:600;margin-bottom:8px;color:var(--text)">Quick add — common warehouse roles</div>
+      <div class="hint" style="font-style:normal;margin-bottom:10px;color:var(--text2)">
+        One-click presets with standard hi-vis colours. Click a preset to add it,
+        then tweak the colour or remove it later if the swatch doesn't match
+        your actual vests.
+      </div>
+      <div id="roles-presets" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:6px"></div>
+    </div>
+
+    <div style="margin-top:18px;padding-top:14px;border-top:1px solid var(--border)">
+      <div style="font-size:13px;font-weight:600;margin-bottom:8px;color:var(--text)">Custom role</div>
       <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
         <label style="flex:1;min-width:140px">Name
           <input type="text" id="roles-add-name" maxlength="64"
-                 placeholder="e.g. supervisor" />
+                 placeholder="e.g. night_shift" />
         </label>
         <label style="width:90px">Colour
           <input type="color" id="roles-add-color" value="#FFA500"
