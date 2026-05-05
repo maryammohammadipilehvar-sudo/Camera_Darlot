@@ -1114,6 +1114,157 @@ def api_event_snapshot(event_id: int):
     )
 
 
+@app.get("/api/events/{event_id}/export")
+def api_event_export(event_id: int):
+    """Stream a one-click incident ZIP for insurance / OSHA filings.
+
+    Bundles: clip.mp4 (if available), snapshot.jpg (if available),
+    event.json (event row, current zone config, action timeline, audit
+    slice ±60s), README.txt (plain-English summary). Filename:
+    incident-{event_id}-{YYYYMMDD-HHMM}.zip.
+    """
+    import io
+    import zipfile
+
+    with _db_lock:
+        c = _conn()
+        ev = c.execute(
+            "SELECT id, ts, camera, kind, detail FROM events WHERE id=?",
+            (event_id,),
+        ).fetchone()
+        if not ev:
+            c.close()
+            raise HTTPException(status_code=404, detail="event not found")
+        ev_d = dict(ev)
+        try:
+            detail = json.loads(ev_d["detail"]) if isinstance(ev_d["detail"], str) else (ev_d["detail"] or {})
+        except Exception:
+            detail = {}
+        ev_d["detail"] = detail
+
+        # Current zone snapshot (if the zone still exists).
+        zone_snapshot = None
+        zid = detail.get("zone_id")
+        if isinstance(zid, int):
+            zr = c.execute(
+                f"SELECT {_ZONE_COLS} FROM forbidden_zones WHERE id=?",
+                (zid,),
+            ).fetchone()
+            if zr:
+                zone_snapshot = _row_to_zone(zr)
+
+        # Action timeline.
+        actions = [
+            _row_to_action(r) for r in c.execute(
+                "SELECT id, event_id, action, actor, ts, note "
+                "FROM event_actions WHERE event_id=? ORDER BY ts ASC",
+                (event_id,),
+            )
+        ]
+
+        # Audit slice: ±60s around the event, plus rows tagged with this
+        # event id explicitly. UNION distinct then order by ts.
+        try:
+            audit_rows = [
+                dict(r) for r in c.execute(
+                    "SELECT id, ts, event_id, camera_id, kind, computed_severity, "
+                    "mode, decision, reason_detail, zone FROM alert_audit "
+                    "WHERE (ts BETWEEN ? AND ?) OR event_id=? "
+                    "ORDER BY ts ASC",
+                    (ev_d["ts"] - 60, ev_d["ts"] + 60, event_id),
+                )
+            ]
+        except sqlite3.OperationalError:
+            audit_rows = []
+
+        c.close()
+
+    # Snapshot + clip file lookups (same monotonic-id glob as the
+    # serve-individual endpoints).
+    monotonic_id = detail.get("event_id")
+    snap_file = None
+    clip_file = None
+    if isinstance(monotonic_id, int):
+        if SNAPSHOT_DIR.is_dir():
+            sm = sorted(SNAPSHOT_DIR.glob(f"*_{monotonic_id}.jpg"))
+            if sm: snap_file = sm[-1]
+        if CLIP_DIR.is_dir():
+            cm = sorted(CLIP_DIR.glob(f"*_{monotonic_id}.mp4"))
+            if cm: clip_file = cm[-1]
+
+    # Plain-English README. Pulls just the bits an insurance/OSHA
+    # reviewer actually wants up top so they don't have to parse JSON.
+    ts_iso = datetime.datetime.fromtimestamp(float(ev_d["ts"])).isoformat(sep=" ", timespec="seconds")
+    z_name = (zone_snapshot or {}).get("name") or detail.get("zone") or "(unknown zone)"
+    sev = (detail.get("severity") or "").upper() or "—"
+    cam = ev_d.get("camera") or "(unknown camera)"
+    kind = ev_d.get("kind") or "—"
+    fa_count = sum(1 for a in actions if a["action"] == "false_alarm")
+    ack_count = sum(1 for a in actions if a["action"] == "acknowledge")
+    disp_count = sum(1 for a in actions if a["action"] == "dispatch")
+    readme_lines = [
+        f"INCIDENT REPORT — event #{event_id}",
+        "=" * 60,
+        f"When            : {ts_iso}",
+        f"Camera          : {cam}",
+        f"Event type      : {kind}",
+        f"Zone            : {z_name}",
+        f"Computed severity: {sev}",
+        f"Shadow mode     : {'YES (no Telegram fired)' if detail.get('shadow') else 'no'}",
+        "",
+        "Operator actions:",
+        f"  Acknowledged : {ack_count}",
+        f"  Dispatched   : {disp_count}",
+        f"  False-alarm  : {fa_count}",
+    ]
+    if actions:
+        readme_lines.append("")
+        readme_lines.append("Action timeline:")
+        for a in actions:
+            ats = datetime.datetime.fromtimestamp(a["ts"]).isoformat(sep=" ", timespec="seconds")
+            readme_lines.append(f"  {ats}  {a['action']}  by {a['actor']}"
+                                + (f"  — {a['note']}" if a.get('note') else ""))
+    readme_lines += [
+        "",
+        "Files in this packet:",
+        "  event.json   - structured event record + zone config + actions + audit slice",
+        "  snapshot.jpg - still frame captured at event-fire time" if snap_file else "  snapshot.jpg - NOT AVAILABLE",
+        "  clip.mp4     - 5-second video around the event"          if clip_file else "  clip.mp4     - NOT AVAILABLE",
+        "",
+        "Generated by the Sentinel security pipeline.",
+    ]
+    readme = "\n".join(readme_lines)
+
+    # Build the ZIP in memory. Events are small + the clip is the big
+    # payload (~30-50KB at 640x360); fits comfortably in RAM.
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("README.txt", readme)
+        zf.writestr("event.json", json.dumps({
+            "event":           ev_d,
+            "zone_current":    zone_snapshot,
+            "actions":         actions,
+            "audit_slice":     audit_rows,
+            "exported_at":     int(time.time()),
+        }, indent=2))
+        if snap_file is not None:
+            zf.write(snap_file, arcname="snapshot.jpg")
+        if clip_file is not None:
+            zf.write(clip_file, arcname="clip.mp4")
+
+    buf.seek(0)
+    when = datetime.datetime.fromtimestamp(float(ev_d["ts"])).strftime("%Y%m%d-%H%M")
+    fname = f"incident-{event_id}-{when}.zip"
+    return Response(
+        content=buf.read(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{fname}"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
 @app.get("/api/events/{event_id}/clip")
 def api_event_clip(event_id: int):
     """Serve the 5-second MP4 clip captured around this event (Phase 2b).

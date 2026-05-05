@@ -631,6 +631,12 @@ td.trunc{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     <div class="modal-footer">
       <div class="modal-kbd">Enter · Acknowledge     Shift+E · Escalate     Esc · Close</div>
       <div class="modal-actions">
+        <button id="btn-export" type="button" onclick="modalExport()"
+                title="Download incident packet (clip + snapshot + zone config + actions + audit slice)"
+                style="font-family:var(--font-ui);font-size:12.5px;font-weight:600;
+                       padding:8px 14px;border-radius:var(--r);cursor:pointer;
+                       background:transparent;color:var(--text);
+                       border:1px solid var(--border2)">↓ Export</button>
         <button id="btn-escalate" class="btn-escalate" onclick="modalEscalate()">⚑ Escalate</button>
         <button id="btn-ack" class="btn-ack" onclick="modalAck()">✓ Acknowledge</button>
       </div>
@@ -1756,6 +1762,24 @@ function modalEscalate(){
   console.log('action=escalate', {id:ev.id, kind:ev.kind, ts:ev.ts});
   _modalToast('Escalated · supervisor will be notified (stub)', 'var(--yellow)');
   closeModal();
+}
+
+function modalExport(){
+  const ev = _modalCurrentEv;
+  if(!ev || ev.id == null){
+    _modalToast('Cannot export — event has no id', 'var(--red)');
+    return;
+  }
+  // Trigger a download via a hidden anchor — the browser handles
+  // streaming + Content-Disposition file naming.
+  const a = document.createElement('a');
+  a.href = `/api/events/${ev.id}/export`;
+  // Hint a default filename in case Content-Disposition is stripped.
+  a.download = `incident-${ev.id}.zip`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  _modalToast('Incident ZIP downloading…', 'var(--accent)');
 }
 
 function modalCopyJson(){
