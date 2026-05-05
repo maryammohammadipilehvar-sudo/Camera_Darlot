@@ -126,6 +126,18 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_ea_event   ON event_actions(event_id);
             CREATE INDEX IF NOT EXISTS idx_ea_actts   ON event_actions(action, ts);
+            CREATE TABLE IF NOT EXISTS zone_rejections (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                zone_id         INTEGER NOT NULL,
+                cx              INTEGER NOT NULL,
+                cy              INTEGER NOT NULL,
+                hour            INTEGER NOT NULL,
+                weekday         INTEGER NOT NULL,
+                source_event_id INTEGER NOT NULL,
+                created_at      INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_zr_zone_hour ON zone_rejections(zone_id, hour);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_zr_source ON zone_rejections(source_event_id);
         """)
         _migrate_forbidden_zones(c)
         c.commit()
@@ -739,6 +751,60 @@ def api_zones_update(zone_id: int, payload: ZoneUpdate):
     return _row_to_zone(row)
 
 
+@app.get("/api/zones/{zone_id}/rejections")
+def api_zone_rejections_list(zone_id: int):
+    """List learned rejections (False-alarm-derived suppressions) for a zone."""
+    with _db_lock:
+        c = _conn()
+        try:
+            rows = c.execute(
+                "SELECT id, zone_id, cx, cy, hour, weekday, source_event_id, created_at "
+                "FROM zone_rejections WHERE zone_id=? ORDER BY created_at DESC",
+                (zone_id,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            rows = []
+        c.close()
+    return {
+        "rejections": [
+            {
+                "id":               r["id"],
+                "zone_id":          r["zone_id"],
+                "cx":               r["cx"],
+                "cy":               r["cy"],
+                "hour":             r["hour"],
+                "weekday":          r["weekday"],
+                "source_event_id":  r["source_event_id"],
+                "created_at":       r["created_at"],
+            } for r in rows
+        ],
+    }
+
+
+@app.delete("/api/rejections/{rejection_id}", status_code=204)
+def api_rejection_delete(rejection_id: int):
+    """Forget a learned rejection (operator clicked False-alarm by mistake)."""
+    with _db_lock:
+        c = _conn()
+        # Read zone_id so we can bump forbidden_zones.updated_at and
+        # trigger a hot reload in the pipeline.
+        row = c.execute(
+            "SELECT zone_id FROM zone_rejections WHERE id=?", (rejection_id,)
+        ).fetchone()
+        if not row:
+            c.close()
+            raise HTTPException(status_code=404, detail="rejection not found")
+        c.execute("DELETE FROM zone_rejections WHERE id=?", (rejection_id,))
+        c.execute(
+            "UPDATE forbidden_zones SET updated_at=? WHERE id=?",
+            (int(time.time()), row["zone_id"]),
+        )
+        c.commit()
+        c.close()
+    log.info(f"rejection forgotten id={rejection_id}")
+    return Response(status_code=204)
+
+
 @app.delete("/api/zones/{zone_id}", status_code=204)
 def api_zones_delete(zone_id: int):
     with _db_lock:
@@ -790,9 +856,12 @@ def api_event_action_create(event_id: int, payload: ActionCreate):
     actor = (payload.actor or "operator").strip()[:64] or "operator"
     note = (payload.note or "").strip()[:500]
     now = int(time.time())
+    rejection_inserted = False
     with _db_lock:
         c = _conn()
-        ev = c.execute("SELECT id FROM events WHERE id=?", (event_id,)).fetchone()
+        ev = c.execute(
+            "SELECT id, ts, kind, detail FROM events WHERE id=?", (event_id,)
+        ).fetchone()
         if not ev:
             c.close()
             raise HTTPException(status_code=404, detail="event not found")
@@ -802,13 +871,55 @@ def api_event_action_create(event_id: int, payload: ActionCreate):
             (event_id, action, actor, now, note),
         )
         row_id = cur.lastrowid
+
+        # Phase 4a: a False-alarm click on a forbidden_zone event seeds a
+        # rejection so the rule stops firing on similar future hits.
+        # Idempotent — UNIQUE INDEX on source_event_id makes a duplicate
+        # click a no-op rather than a doubled rejection.
+        if action == "false_alarm" and str(ev["kind"]) == "forbidden_zone":
+            try:
+                detail = json.loads(ev["detail"]) if isinstance(ev["detail"], str) else (ev["detail"] or {})
+            except Exception:
+                detail = {}
+            zone_id = detail.get("zone_id")
+            bbox = detail.get("bbox") or []
+            if isinstance(zone_id, int) and len(bbox) == 4:
+                cx = int((int(bbox[0]) + int(bbox[2])) / 2)
+                cy = int((int(bbox[1]) + int(bbox[3])) / 2)
+                try:
+                    ts_local = datetime.datetime.fromtimestamp(float(ev["ts"]))
+                    hour = ts_local.hour
+                    weekday = ts_local.weekday()
+                except Exception:
+                    hour, weekday = 0, 0
+                try:
+                    c.execute(
+                        "INSERT INTO zone_rejections "
+                        "(zone_id, cx, cy, hour, weekday, source_event_id, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (zone_id, cx, cy, hour, weekday, event_id, now),
+                    )
+                    rejection_inserted = True
+                except sqlite3.IntegrityError:
+                    # Duplicate False-alarm on same event — ignore.
+                    pass
+                # Bump forbidden_zones.updated_at so the engine picks up
+                # the new rejection on its next 5s reload tick.
+                c.execute(
+                    "UPDATE forbidden_zones SET updated_at=? WHERE id=?",
+                    (now, zone_id),
+                )
+
         c.commit()
         row = c.execute(
             "SELECT id, event_id, action, actor, ts, note "
             "FROM event_actions WHERE id=?", (row_id,),
         ).fetchone()
         c.close()
-    log.info(f"event_action recorded event_id={event_id} action={action} actor={actor!r}")
+    log.info(
+        f"event_action recorded event_id={event_id} action={action} "
+        f"actor={actor!r} rejection_seeded={rejection_inserted}"
+    )
     return _row_to_action(row)
 
 

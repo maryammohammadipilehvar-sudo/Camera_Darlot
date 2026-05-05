@@ -1905,6 +1905,71 @@ async function zoneDelete(id){
   if(!r.ok) throw new Error('Delete failed: http ' + r.status);
 }
 
+async function rejectionForget(id){
+  const r = await fetch('/api/rejections/' + id, {method: 'DELETE'});
+  if(!r.ok) throw new Error('Forget failed: http ' + r.status);
+}
+
+// Plain rendering — no styling beyond the existing zone-modal classes,
+// so it matches the look of the zone config modal.
+function zoneRejectionsModal(zone, rejections){
+  zoneClosePopup();
+  const wrap = document.createElement('div');
+  wrap.className = 'zone-modal-backdrop';
+  wrap.onclick = (e) => { if(e.target === wrap) wrap.remove(); };
+
+  const renderRows = (list) => list.map(r => {
+    const when = new Date(r.created_at * 1000).toLocaleString('en-GB', {hour12:false});
+    const wkd = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'][r.weekday] || '?';
+    return `<tr>
+      <td>${r.cx}, ${r.cy}</td>
+      <td>${String(r.hour).padStart(2,'0')}:00 (${wkd})</td>
+      <td class="mono dim">#${r.source_event_id}</td>
+      <td>${when}</td>
+      <td><button type="button" data-rid="${r.id}"
+                  style="font-size:10px;padding:3px 9px;border-radius:3px;
+                         border:1px solid var(--red);background:transparent;
+                         color:var(--red);cursor:pointer">Forget</button></td>
+    </tr>`;
+  }).join('');
+
+  wrap.innerHTML = `
+    <div class="zone-modal" style="width:min(640px,94vw)">
+      <h3>Learned suppressions — ${escAttr(zone.name)}</h3>
+      <div class="hint" style="font-style:normal;margin-bottom:14px;color:var(--text2)">
+        Each row was created when you clicked "False alarm" on a forbidden-zone
+        event. The pipeline now skips firing for similar hits in this zone at
+        the same hour. Click <em>Forget</em> if a suppression turns out to be wrong.
+      </div>
+      <table style="width:100%;border-collapse:collapse;font-size:12px">
+        <thead><tr style="text-align:left;color:var(--text3);font-size:10.5px;
+          letter-spacing:1px">
+          <th style="padding:6px 4px">Center (px)</th>
+          <th style="padding:6px 4px">Hour</th>
+          <th style="padding:6px 4px">From event</th>
+          <th style="padding:6px 4px">Created</th>
+          <th style="padding:6px 4px"></th>
+        </tr></thead>
+        <tbody id="zone-rej-body">${renderRows(rejections)}</tbody>
+      </table>
+      <div class="zone-modal-acts">
+        <button type="button" onclick="this.closest('.zone-modal-backdrop').remove()">Close</button>
+      </div>
+    </div>`;
+  document.body.appendChild(wrap);
+
+  wrap.querySelector('#zone-rej-body').addEventListener('click', async (e) => {
+    const btn = e.target.closest('button[data-rid]');
+    if(!btn) return;
+    const rid = Number(btn.dataset.rid);
+    if(!confirm('Forget this suppression?')) return;
+    try{
+      await rejectionForget(rid);
+      btn.closest('tr').remove();
+    } catch(err){ alert(String(err)); }
+  });
+}
+
 function zoneClosePopup(){
   if(_zoneState.popup){
     _zoneState.popup.remove();
@@ -1934,8 +1999,10 @@ function zoneShowPopup(zone, clientX, clientY){
     : '';
   div.innerHTML =
     `<div class="zone-popup-name"></div>` +
-    `<div class="hint" style="font-size:10px;color:var(--text3);margin-bottom:8px"></div>` +
+    `<div class="hint" style="font-size:10px;color:var(--text3);margin-bottom:6px"></div>` +
+    `<div class="zone-rej-line" style="font-size:10px;color:var(--text3);margin-bottom:8px;display:none"></div>` +
     `<button type="button" class="edit-btn">Edit</button>` +
+    `<button type="button" class="rej-btn" style="border-color:var(--text2);color:var(--text2);margin-right:6px;display:none">Suppressions</button>` +
     `<button type="button">Delete</button>`;
   div.querySelector('.zone-popup-name').textContent = zone.name || ('Zone #' + zone.id);
   div.querySelector('.hint').textContent = `${tier} · ${winText}${dw}${shadowSuffix}`;
@@ -1943,7 +2010,7 @@ function zoneShowPopup(zone, clientX, clientY){
     zoneClosePopup();
     zoneModalOpen({mode:'edit', zone:zone});
   });
-  div.querySelector('button:not(.edit-btn)').addEventListener('click', async () => {
+  div.querySelector('button:not(.edit-btn):not(.rej-btn)').addEventListener('click', async () => {
     if(!confirm(`Delete zone "${zone.name}"?`)) return;
     try{
       await zoneDelete(zone.id);
@@ -1953,6 +2020,17 @@ function zoneShowPopup(zone, clientX, clientY){
       alert(String(e));
     }
   });
+  // Phase 4a: lazy-fetch rejection count and reveal the row + button.
+  fetch(`/api/zones/${zone.id}/rejections`).then(r => r.json()).then(data => {
+    const n = (data.rejections || []).length;
+    if(!n) return;
+    const line = div.querySelector('.zone-rej-line');
+    const btn  = div.querySelector('.rej-btn');
+    line.textContent = `${n} learned suppression${n === 1 ? '' : 's'}`;
+    line.style.display = '';
+    btn.style.display  = '';
+    btn.addEventListener('click', () => zoneRejectionsModal(zone, data.rejections));
+  }).catch(() => {});
   wrap.appendChild(div);
   _zoneState.popup = div;
 }

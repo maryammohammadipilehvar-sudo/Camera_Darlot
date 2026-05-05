@@ -2337,13 +2337,20 @@ class ForbiddenZoneEngine:
     reload thread mutates ``self._zones``. Both paths take ``self._lock``.
     """
 
-    def __init__(self, db_path: str, frame_w: int, frame_h: int) -> None:
+    def __init__(self, db_path: str, frame_w: int, frame_h: int,
+                 rejection_radius_px: int = 60) -> None:
         self._db_path = db_path
         self._frame_w = frame_w
         self._frame_h = frame_h
         # zones format after load: [{"id": int, "name": str,
         #                            "poly": np.ndarray (N,2) int32}]
         self._zones: list = []
+        # Phase 4a — learned suppressions populated by False-alarm clicks.
+        # Stored as list[dict(zone_id, cx, cy, hour)] so check_rejection
+        # can do a fast linear scan (a 30-camera site won't accumulate
+        # more than a few hundred rows in normal use).
+        self._rejections: list = []
+        self._rejection_radius_px = int(rejection_radius_px)
         self._last_meta: tuple = (-1, -1)  # (count, max_updated_at)
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -2454,9 +2461,35 @@ class ForbiddenZoneEngine:
         except Exception as e:
             log.warning("FORBIDDEN_ZONE: reload failed: %s", e)
             return
+
+        # Phase 4a — also load learned rejections (False-alarm clicks).
+        # Tolerate the table being absent on a pre-Phase-4a DB.
+        new_rej: list = []
+        try:
+            for row in self._conn.execute(
+                "SELECT zone_id, cx, cy, hour FROM zone_rejections"
+            ):
+                try:
+                    new_rej.append({
+                        "zone_id": int(row[0]),
+                        "cx":      int(row[1]),
+                        "cy":      int(row[2]),
+                        "hour":    int(row[3]),
+                    })
+                except Exception:
+                    continue
+        except sqlite3.OperationalError:
+            pass  # table doesn't exist yet — pre-Phase-4a
+        except Exception as e:
+            log.warning("FORBIDDEN_ZONE: rejection reload failed: %s", e)
+
         with self._lock:
             self._zones = new
-        log.info("FORBIDDEN_ZONE reloaded: %d zone(s)", len(new))
+            self._rejections = new_rej
+        log.info(
+            "FORBIDDEN_ZONE reloaded: %d zone(s), %d rejection(s)",
+            len(new), len(new_rej),
+        )
 
     def start_reload_thread(self, interval_s: float = 5.0) -> None:
         self._open_ro()
@@ -2489,6 +2522,28 @@ class ForbiddenZoneEngine:
             if cv2.pointPolygonTest(z["poly"], (cx, cy), False) >= 0:
                 return z
         return None
+
+    def check_rejection(self, zone_id: int, cx: int, cy: int, hour: int) -> bool:
+        """Return True when this hit is suppressed by a learned rejection.
+
+        Matches when there's any rejection for this zone, at the same
+        hour, whose stored centroid is within ``rejection_radius_px``
+        of the queried (cx, cy). The hour bucket keeps a daytime FA
+        from suppressing a nighttime intrusion at the same spot.
+        """
+        with self._lock:
+            rej = list(self._rejections)
+        if not rej:
+            return False
+        r2 = self._rejection_radius_px * self._rejection_radius_px
+        for r in rej:
+            if r["zone_id"] != zone_id or r["hour"] != hour:
+                continue
+            dx = r["cx"] - cx
+            dy = r["cy"] - cy
+            if dx * dx + dy * dy <= r2:
+                return True
+        return False
 
     def all_polys(self) -> list:
         """Return shallow copy of zones for the live-feed overlay."""

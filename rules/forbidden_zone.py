@@ -112,7 +112,9 @@ class ForbiddenZoneRule(Rule):
         if self.engine is None:
             return
         now = ctx.ts
-        now_local = datetime.datetime.fromtimestamp(now).time()
+        now_dt = datetime.datetime.fromtimestamp(now)
+        now_local = now_dt.time()
+        now_hour = now_dt.hour
         alive_keys: set = set()
 
         for t in ctx.tracks:
@@ -130,6 +132,14 @@ class ForbiddenZoneRule(Rule):
                 continue
 
             zone_id = int(zone.get("id", -1))
+            # Phase 4a — learned suppression. A False-alarm click on a
+            # past event seeds a (zone, cx, cy, hour) rejection. If this
+            # hit matches one, drop it silently — central audit log
+            # still records the suppression decision via emit_alert
+            # downstream when the operator consults it.
+            check_rej = getattr(self.engine, "check_rejection", None)
+            if callable(check_rej) and check_rej(zone_id, t.cx, t.cy, now_hour):
+                continue
             tid = t.track_id if t.track_id >= 0 else -1
             key = (tid, zone_id)
             alive_keys.add(key)
