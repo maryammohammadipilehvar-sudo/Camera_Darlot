@@ -88,6 +88,7 @@ CFG = {
     "yolo_conf":       0.25,
     "yolo_iou":        0.5,
     "person_class_id": 0,                     # COCO 'person'
+    "dog_class_id":    16,                    # COCO 'dog'
     "infer_w":         1920,
     "infer_h":         1080,
     "inference_fps":   6.0,                   # ceiling, not floor
@@ -98,6 +99,7 @@ CFG = {
     # placing a 1.7m-tall person at a known distance and back-solving:
     #   focal_length_px = (distance_m * bbox_h_px) / 1.7
     "assumed_person_height_m": 1.7,
+    "assumed_dog_height_m":    0.6,           # median standing dog height
     "focal_length_px":         938.0,
     "far_threshold_m":         8.0,
     "min_bbox_height_px":      12,            # ignore detections below this
@@ -186,6 +188,7 @@ _state: dict = {
     "frames_in": 0,
     "last_frame_at": 0.0,
     "last_persons": [],
+    "last_dogs": [],
     "rtsp_open": False,
     "errors_total": 0,
     "zoom_enabled": False,
@@ -252,6 +255,7 @@ class _HealthHandler(http.server.BaseHTTPRequestHandler):
             ),
             "errors_total": _state["errors_total"],
             "last_persons": _state["last_persons"],
+            "last_dogs": _state["last_dogs"],
         }).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -569,9 +573,9 @@ class _FollowZoom:
 
 
 def _annotate(
-    frame: np.ndarray, persons: list, far_threshold_m: float
+    frame: np.ndarray, persons: list, dogs: list, far_threshold_m: float
 ) -> np.ndarray:
-    """Draw bbox + distance label for each person on a copy of ``frame``."""
+    """Draw bbox + distance label for each person and dog on ``frame``."""
     out = frame
     for p in persons:
         x1, y1, x2, y2 = p["bbox"]
@@ -585,19 +589,28 @@ def _annotate(
             out, label, (x1, max(0, y1 - 8)),
             cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA,
         )
+    for dg in dogs:
+        x1, y1, x2, y2 = dg["bbox"]
+        d = dg["distance_m"]
+        color = (255, 255, 0)  # cyan in BGR — distinct from person colors
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(
+            out, f"dog {d:.1f}m", (x1, max(0, y1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA,
+        )
     return out
 
 
 def _run_inference(model, frame_bgr: np.ndarray) -> list:
-    """Run YOLO on ``frame_bgr`` (already at infer_w x infer_h) and return persons.
+    """Run YOLO on ``frame_bgr`` (already at infer_w x infer_h) and return dets.
 
-    Each person dict has bbox in INFER coordinates (caller must scale).
+    Each detection dict has ``cls_id`` + bbox in INFER coordinates (caller scales).
     """
     results = model.predict(
         frame_bgr,
         conf=CFG["yolo_conf"],
         iou=CFG["yolo_iou"],
-        classes=[CFG["person_class_id"]],
+        classes=[CFG["person_class_id"], CFG["dog_class_id"]],
         verbose=False,
     )[0]
     out = []
@@ -606,7 +619,8 @@ def _run_inference(model, frame_bgr: np.ndarray) -> list:
     for box in results.boxes:
         xyxy = box.xyxy[0].detach().cpu().numpy().tolist()
         conf = float(box.conf[0].detach().cpu().numpy())
-        out.append({"xyxy_infer": xyxy, "conf": conf})
+        cls_id = int(box.cls[0].detach().cpu().numpy())
+        out.append({"xyxy_infer": xyxy, "conf": conf, "cls_id": cls_id})
     return out
 
 
@@ -662,6 +676,7 @@ def main() -> None:
     target_dt = 1.0 / max(CFG["inference_fps"], 1.0)
     last_inf_t = 0.0
     persons: list = []  # last computed list, reused between inferences
+    dogs: list = []
     global _latest_jpeg
 
     while True:
@@ -697,6 +712,7 @@ def main() -> None:
             scale_x = W_full / float(CFG["infer_w"])
             scale_y = H_full / float(CFG["infer_h"])
             persons = []
+            dogs = []
             for r in raw:
                 x1, y1, x2, y2 = r["xyxy_infer"]
                 x1i = int(x1 * scale_x); y1i = int(y1 * scale_y)
@@ -704,20 +720,41 @@ def main() -> None:
                 bbox_h = y2i - y1i
                 if bbox_h < CFG["min_bbox_height_px"]:
                     continue
-                d = estimate_distance_m(
-                    bbox_h,
-                    CFG["focal_length_px"],
-                    CFG["assumed_person_height_m"],
+                is_dog = r["cls_id"] == CFG["dog_class_id"]
+                real_h = (
+                    CFG["assumed_dog_height_m"] if is_dog
+                    else CFG["assumed_person_height_m"]
                 )
-                persons.append({
+                d = estimate_distance_m(
+                    bbox_h, CFG["focal_length_px"], real_h,
+                )
+                det = {
                     "bbox": (x1i, y1i, x2i, y2i),
                     "conf": round(r["conf"], 3),
                     "bbox_h_px": bbox_h,
                     "distance_m": round(d, 2),
-                    "far": d >= CFG["far_threshold_m"],
-                })
+                }
+                if is_dog:
+                    dogs.append(det)
+                else:
+                    det["far"] = d >= CFG["far_threshold_m"]
+                    persons.append(det)
 
             _state["last_persons"] = persons
+            _state["last_dogs"] = dogs
+            if dogs:
+                log.info(
+                    "dog(s) at %s",
+                    [f"{d['distance_m']:.1f}m" for d in dogs],
+                )
+                _log_event(
+                    CFG["event_log_path"],
+                    {
+                        "kind": "dog",
+                        "camera_id": CFG["camera_id"],
+                        "dogs": dogs,
+                    },
+                )
             far_persons = [p for p in persons if p["far"]]
             if far_persons:
                 log.info(
@@ -736,7 +773,7 @@ def main() -> None:
             if zoom_ctrl is not None:
                 zoom_ctrl.update(persons, frame_h=H_full)
 
-        annotated = _annotate(frame, persons, CFG["far_threshold_m"])
+        annotated = _annotate(frame, persons, dogs, CFG["far_threshold_m"])
 
         # Digital follow-zoom: when a person is present, crop around them
         # before scaling to the MJPEG output. Detection above already used
