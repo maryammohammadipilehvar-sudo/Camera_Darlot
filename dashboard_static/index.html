@@ -179,42 +179,55 @@ body::after{content:'';position:fixed;inset:0;
 #view-history.hidden, #view-live.hidden, #view-reports.hidden{display:none}
 #view-reports{overflow-y:auto}
 #view-reports .reports-wrap{max-width:1100px;margin:0 auto;width:100%}
-#view-reports h2{font-size:18px;font-weight:600;letter-spacing:.5px;margin:0 0 4px;
+#view-reports h2{font-size:22px;font-weight:600;letter-spacing:0;margin:0 0 6px;
   color:var(--text)}
-#view-reports .reports-sub{font-family:var(--font-mono);font-size:11.5px;
-  color:var(--text2);margin-bottom:18px}
-#view-reports .reports-controls{display:flex;gap:8px;align-items:center;
-  margin-bottom:18px;flex-wrap:wrap}
+#view-reports .reports-sub{font-family:var(--font-mono);font-size:13px;
+  color:var(--text);margin-bottom:22px}
+#view-reports .reports-controls{display:flex;gap:12px;align-items:center;
+  margin-bottom:22px;flex-wrap:wrap}
+#view-reports .reports-controls label{font-size:13px;color:var(--text);
+  display:flex;align-items:center;gap:8px}
 #view-reports .reports-controls select,
-#view-reports .reports-controls input{padding:6px 10px;background:var(--bg);
-  border:1px solid var(--border);border-radius:var(--r);color:var(--text);
-  font-family:var(--font-ui);font-size:12px}
-#view-reports .tile-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));
-  gap:10px;margin-bottom:18px}
-.r-tile{background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);
-  padding:14px 16px}
-.r-tile .lbl{font-size:10.5px;letter-spacing:1.4px;color:var(--text2);
-  font-weight:600;text-transform:uppercase}
-.r-tile .val{font-size:24px;font-weight:600;color:var(--text);margin-top:4px}
-.r-tile .sub{font-size:11px;color:var(--text3);margin-top:2px;font-family:var(--font-mono)}
+#view-reports .reports-controls input{padding:8px 12px;background:var(--bg);
+  border:1px solid var(--border2);border-radius:var(--r);color:var(--text);
+  font-family:var(--font-ui);font-size:13px}
+#view-reports .reports-controls button{padding:8px 16px;font-size:13px;
+  font-weight:600;border-radius:var(--r);border:1px solid var(--border2);
+  background:var(--bg);color:var(--text);cursor:pointer}
+#view-reports .reports-controls button:hover{border-color:var(--accent);color:var(--accent)}
+#view-reports .tile-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));
+  gap:12px;margin-bottom:22px}
+.r-tile{background:var(--bg3);border:1px solid var(--border2);border-radius:var(--r);
+  padding:18px 20px}
+.r-tile .lbl{font-size:13px;letter-spacing:0;color:var(--text);
+  font-weight:700;text-transform:none}
+.r-tile .val{font-size:30px;font-weight:600;color:var(--text);margin-top:6px;
+  line-height:1.1}
+.r-tile .sub{font-size:12.5px;color:var(--text2);margin-top:4px;
+  font-family:var(--font-ui)}
 .r-tile.r-bad .val{color:var(--red)}
 .r-tile.r-good .val{color:var(--accent)}
 .r-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-bottom:18px}
 @media(max-width:760px){.r-grid{grid-template-columns:1fr}}
-.r-card{background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);
-  padding:14px 18px}
-.r-card h3{font-size:12px;letter-spacing:1.2px;text-transform:uppercase;
-  color:var(--text2);margin:0 0 10px;font-weight:600}
-.r-card table{width:100%;border-collapse:collapse;font-size:12.5px}
-.r-card th, .r-card td{text-align:left;padding:6px 4px;border-bottom:1px solid var(--border)}
-.r-card th{color:var(--text3);font-weight:500;font-size:10.5px;
-  text-transform:uppercase;letter-spacing:1px}
+.r-card{background:var(--bg3);border:1px solid var(--border2);border-radius:var(--r);
+  padding:18px 22px}
+.r-card h3{font-size:15px;letter-spacing:0;text-transform:none;
+  color:var(--text);margin:0 0 14px;font-weight:700}
+.r-card .r-section-head{font-size:13px;color:var(--text);font-weight:600;
+  margin:14px 0 6px;letter-spacing:0}
+.r-card table{width:100%;border-collapse:collapse;font-size:14px}
+.r-card th, .r-card td{text-align:left;padding:9px 6px;border-bottom:1px solid var(--border)}
+.r-card th{color:var(--text);font-weight:700;font-size:12.5px;
+  text-transform:none;letter-spacing:0}
+.r-card td{color:var(--text)}
 .r-card td.num, .r-card th.num{text-align:right;font-family:var(--font-mono)}
-.r-card .empty{color:var(--text3);font-style:italic;font-size:11px;padding:10px 4px}
-.r-samples{display:flex;flex-wrap:wrap;gap:6px}
-.r-samples a{font-family:var(--font-mono);font-size:11px;padding:3px 8px;
+.r-card td.muted{color:var(--text2);font-style:italic}
+.r-card .empty{color:var(--text2);font-style:italic;font-size:13px;padding:12px 6px}
+.r-card .note{font-size:12.5px;color:var(--text2);margin:0 0 12px;line-height:1.5}
+.r-samples{display:flex;flex-wrap:wrap;gap:8px}
+.r-samples a{font-family:var(--font-mono);font-size:13px;padding:5px 10px;
   background:var(--bg);border:1px solid var(--border2);border-radius:3px;
-  color:var(--text2);cursor:pointer;text-decoration:none}
+  color:var(--text);cursor:pointer;text-decoration:none;font-weight:600}
 .r-samples a:hover{border-color:var(--accent);color:var(--accent)}
 
 /* History view (full-screen mode) — overrides the embedded panel sizing
@@ -286,36 +299,40 @@ body::after{content:'';position:fixed;inset:0;
 .zone-hint.hidden{display:none}
 .zone-popup .edit-btn{border-color:var(--accent);color:var(--accent);margin-right:6px}
 .zone-popup .edit-btn:hover{background:var(--accent);color:#04110a}
+.zone-popup{font-size:13px}
+.zone-popup-name{font-size:14px}
+.zone-popup .hint, .zone-popup .zone-rej-line{
+  font-size:12px !important; color:var(--text2) !important; line-height:1.4}
 
 /* ── Zone config modal (Restricted Areas Phase 1) ──────────────────────── */
-.zone-modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.7);
+.zone-modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.78);
   display:flex;align-items:center;justify-content:center;z-index:20;
   font-family:var(--font-ui)}
 .zone-modal-backdrop.hidden{display:none}
 .zone-modal{background:var(--bg2);border:1px solid var(--border2);
-  border-radius:var(--r);padding:18px 22px;width:min(440px,92vw);
+  border-radius:var(--r);padding:22px 26px;width:min(460px,92vw);
   max-height:90vh;overflow:auto;box-shadow:0 8px 32px rgba(0,0,0,.6);
   color:var(--text)}
-.zone-modal h3{margin:0 0 14px;font-size:14px;letter-spacing:1px;
+.zone-modal h3{margin:0 0 18px;font-size:17px;letter-spacing:.3px;
   color:var(--accent);font-weight:700}
-.zone-modal label{display:block;margin-bottom:12px;font-size:11px;
-  letter-spacing:.5px;color:var(--text2);font-weight:600}
+.zone-modal label{display:block;margin-bottom:16px;font-size:13px;
+  letter-spacing:0;color:var(--text);font-weight:600}
 .zone-modal input[type="text"],
 .zone-modal input[type="number"],
-.zone-modal select{width:100%;margin-top:4px;padding:7px 10px;
-  background:var(--bg);border:1px solid var(--border);
-  border-radius:var(--r);color:var(--text);font-size:12px;
-  font-family:var(--font-ui);box-sizing:border-box}
+.zone-modal select{width:100%;margin-top:6px;padding:9px 12px;
+  background:var(--bg);border:1px solid var(--border2);
+  border-radius:var(--r);color:var(--text);font-size:14px;
+  font-family:var(--font-ui);box-sizing:border-box;font-weight:400}
 .zone-modal input:focus,.zone-modal select:focus{outline:none;
   border-color:var(--accent)}
-.zone-modal .row{display:flex;gap:10px}
+.zone-modal .row{display:flex;gap:12px}
 .zone-modal .row label{flex:1}
-.zone-modal .hint{font-size:10px;color:var(--text3);font-weight:400;
-  margin-top:3px;line-height:1.4}
-.zone-modal-acts{display:flex;justify-content:flex-end;gap:8px;
-  margin-top:18px;padding-top:14px;border-top:1px solid var(--border)}
-.zone-modal-acts button{padding:7px 16px;font-size:11px;font-weight:600;
-  letter-spacing:1px;border-radius:var(--r);cursor:pointer;
+.zone-modal .hint{font-size:12px;color:var(--text2);font-weight:400;
+  margin-top:5px;line-height:1.45}
+.zone-modal-acts{display:flex;justify-content:flex-end;gap:10px;
+  margin-top:20px;padding-top:16px;border-top:1px solid var(--border)}
+.zone-modal-acts button{padding:9px 18px;font-size:13px;font-weight:600;
+  letter-spacing:.3px;border-radius:var(--r);cursor:pointer;
   border:1px solid var(--border2);background:transparent;color:var(--text)}
 .zone-modal-acts button:hover{border-color:var(--accent);color:var(--accent)}
 .zone-modal-acts button.primary{background:var(--accent);color:#04110a;
@@ -395,24 +412,27 @@ body::after{content:'';position:fixed;inset:0;
 .sev-t-info    {color:var(--sev-info-text)}
 
 /* ─── Event-card action buttons (Phase 2a) ────────────────────────────── */
-.ev-actions{display:flex;gap:6px;margin-top:6px;flex-wrap:wrap}
-.ev-actions button{font-size:10.5px;font-weight:600;letter-spacing:.6px;
-  padding:3px 9px;border-radius:3px;cursor:pointer;border:1px solid;
-  background:transparent;color:var(--text2);border-color:var(--border2);
+.ev-actions{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap}
+.ev-actions button{font-size:12.5px;font-weight:600;letter-spacing:0;
+  padding:5px 12px;border-radius:4px;cursor:pointer;border:1px solid;
+  background:transparent;color:var(--text);border-color:var(--border2);
   font-family:var(--font-ui);transition:background .15s,color .15s,border-color .15s}
 .ev-actions button:hover{color:var(--accent);border-color:var(--accent)}
 .ev-actions .act-fa:hover{color:var(--red);border-color:var(--red)}
 .ev-actions .act-disp:hover{color:var(--yellow);border-color:var(--yellow)}
 /* SHADOW pill: tells the operator "this didn't page anyone yet". */
-.shadow-pill{display:inline-block;font-size:9.5px;font-weight:700;
-  letter-spacing:1.4px;padding:1px 6px;border-radius:3px;border:1px solid;
-  color:var(--text2);border-color:var(--border2);background:var(--bg)}
-.ev-footer{margin-top:6px;font-size:10.5px;color:var(--text3);font-style:italic;
-  letter-spacing:.3px;font-family:var(--font-mono)}
-.ev-footer .ev-fact{color:var(--text2);font-style:normal;font-weight:600}
+.shadow-pill{display:inline-block;font-size:11px;font-weight:700;
+  letter-spacing:1px;padding:2px 8px;border-radius:3px;border:1px solid;
+  color:var(--text);border-color:var(--text2);background:var(--bg)}
+.ev-footer{margin-top:8px;font-size:12.5px;color:var(--text);font-style:normal;
+  letter-spacing:0;font-family:var(--font-ui)}
+.ev-footer .ev-fact{color:var(--text);font-style:normal;font-weight:700}
 .ev-footer.ev-fa{color:var(--red)}
+.ev-footer.ev-fa .ev-fact{color:var(--red)}
 .ev-footer.ev-ack{color:var(--accent)}
+.ev-footer.ev-ack .ev-fact{color:var(--accent)}
 .ev-footer.ev-disp{color:var(--yellow)}
+.ev-footer.ev-disp .ev-fact{color:var(--yellow)}
 
 /* ─── Badges ──────────────────────────────────────────────────────────────── */
 .badge{display:inline-block;padding:2px 8px;border-radius:3px;
@@ -806,7 +826,13 @@ td.trunc{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
       <div class="r-card" style="margin-bottom:18px">
         <h3>Forbidden-zone breaches by zone</h3>
-        <table id="r-byzone"><thead><tr><th>Zone</th><th class="num">Count</th></tr></thead><tbody></tbody></table>
+        <p class="note" id="r-byzone-note"></p>
+
+        <div class="r-section-head" id="r-byzone-active-head">Currently-configured zones</div>
+        <table id="r-byzone-active"><thead><tr><th>Zone</th><th class="num">Count</th></tr></thead><tbody></tbody></table>
+
+        <div class="r-section-head" id="r-byzone-deleted-head">Historical (zones you have deleted)</div>
+        <table id="r-byzone-deleted"><thead><tr><th>Zone (deleted)</th><th class="num">Count</th></tr></thead><tbody></tbody></table>
       </div>
 
       <div class="r-card" style="margin-bottom:18px">
@@ -1058,11 +1084,14 @@ function renderReport(data){
   const fp = data.fp || {by_camera:{}, per_camera_per_week:{}, over_budget_per_camera:{}};
   const fpTotal = Object.values(fp.by_camera || {}).reduce((a,b) => a + b, 0);
   const overBudget = Object.values(fp.over_budget_per_camera || {}).some(Boolean);
+  const zonesNow = data.zones_configured ?? 0;
   const tiles = [
+    _rTile('Zones configured', zonesNow, zonesNow === 0 ? 'no zones drawn yet' : 'in this site',
+           zonesNow === 0 ? 'r-bad' : 'r-good'),
     _rTile('Total events',  t.events ?? 0),
-    _rTile('Shadow events', sh.count, 'no Telegram fired'),
+    _rTile('Shadow events', sh.count, 'reached dashboard, did NOT page'),
     _rTile('After-hours',   ah.count, 'forbidden_zone, 18:00–06:00'),
-    _rTile('False alarms',  fpTotal, `target < 2 / camera / week`,
+    _rTile('False alarms',  fpTotal, 'target < 2 / camera / week',
            overBudget ? 'r-bad' : (fpTotal === 0 ? 'r-good' : '')),
   ];
   document.getElementById('r-tiles').innerHTML = tiles.join('');
@@ -1073,9 +1102,40 @@ function renderReport(data){
   _rFillTable('#r-bycamera',
     Object.entries(t.by_camera || {}).map(([k,v]) => [k, v]),
     'No events in window');
-  _rFillTable('#r-byzone',
-    Object.entries(data.by_zone || {}).map(([k,v]) => [k, v]),
-    'No forbidden_zone events in window');
+
+  // Split zone breakdown so the operator sees current vs historical.
+  const activeZ  = data.by_zone_active  || {};
+  const deletedZ = data.by_zone_deleted || {};
+  const activeRows  = Object.entries(activeZ).map(([k,v]) => [k, v]);
+  const deletedRows = Object.entries(deletedZ).map(([k,v]) => [k, v]);
+  _rFillTable('#r-byzone-active',  activeRows,
+    zonesNow === 0
+      ? 'You have not drawn any zones yet — go to the Live tab and click "Draw zone".'
+      : 'No events in your currently-drawn zones for this window.');
+  _rFillTable('#r-byzone-deleted', deletedRows,
+    'No historical events from deleted zones.');
+
+  // Hide the deleted-zone section entirely when there's nothing in it,
+  // and tune the explanatory note so the operator knows exactly what
+  // they're looking at.
+  const delHead  = document.getElementById('r-byzone-deleted-head');
+  const delTable = document.getElementById('r-byzone-deleted');
+  const haveDel  = deletedRows.length > 0;
+  delHead.style.display  = haveDel ? '' : 'none';
+  delTable.style.display = haveDel ? '' : 'none';
+  const note = document.getElementById('r-byzone-note');
+  if(zonesNow === 0 && (activeRows.length || haveDel)){
+    note.textContent =
+      'You have no zones drawn right now, but this report includes events ' +
+      'from zones that existed earlier and were deleted. Draw new zones in ' +
+      'the Live tab to start collecting fresh data.';
+  } else if(haveDel){
+    note.textContent =
+      'Some events below come from zones you have since deleted — those ' +
+      'are shown separately so they do not skew your active-zone view.';
+  } else {
+    note.textContent = '';
+  }
 
   const fpRows = Object.keys(fp.by_camera || {}).map(cam => [
     cam,

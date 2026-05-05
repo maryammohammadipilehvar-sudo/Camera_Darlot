@@ -1128,22 +1128,44 @@ def api_reports_weekly(
             )
         }
 
+        # Currently-configured zones: id → name. Used to split historical
+        # forbidden_zone events into "active zone" rows (the operator
+        # still has this zone drawn) vs "deleted zone" rows (events from
+        # zones that have since been removed). Without this split the
+        # report misleads when zones are deleted and the historical
+        # events linger in the table.
+        try:
+            current_zones = {
+                int(r["id"]): str(r["name"])
+                for r in c.execute("SELECT id, name FROM forbidden_zones")
+            }
+        except sqlite3.OperationalError:
+            current_zones = {}
+
         # Walk forbidden_zone rows once to build zone + shadow + after-hours
         # counters. detail.shadow is a per-event flag; detail.zone is the
         # human zone name; ts is the event-fire time for the after-hours
-        # bucket (0:00–6:00 or 18:00–24:00 local — coarse but useful).
+        # bucket (00:00–06:00 or 18:00–24:00 local — coarse but useful).
         zone_rows = c.execute(
             f"SELECT ts, detail FROM events WHERE kind='forbidden_zone' "
             f"AND ts>=? AND ts<=?{cam_clause}",
             args_e,
         ).fetchall()
-        by_zone: dict = {}
+        by_zone_active: dict = {}
+        by_zone_deleted: dict = {}
         shadow_count = 0
         after_hours = 0
         for r in zone_rows:
             d = _detail_dict(r["detail"])
+            zid = d.get("zone_id")
             zname = str(d.get("zone") or d.get("zone_name") or "—")
-            by_zone[zname] = by_zone.get(zname, 0) + 1
+            # Resolve to the live name when the id still exists, so renames
+            # are reflected in the active breakdown.
+            if isinstance(zid, int) and zid in current_zones:
+                live = current_zones[zid]
+                by_zone_active[live] = by_zone_active.get(live, 0) + 1
+            else:
+                by_zone_deleted[zname] = by_zone_deleted.get(zname, 0) + 1
             if d.get("shadow"):
                 shadow_count += 1
             try:
@@ -1210,9 +1232,15 @@ def api_reports_weekly(
             "by_kind":    by_kind,
             "by_camera":  by_camera,
         },
+        "zones_configured": len(current_zones),
         "shadow":      {"count": shadow_count},
         "after_hours": {"count": after_hours},
-        "by_zone":     by_zone,
+        # by_zone kept as a merged view for backwards compatibility, but
+        # the UI should prefer by_zone_active vs by_zone_deleted so the
+        # operator can tell apart "still-drawn zone" vs "zone you deleted".
+        "by_zone":          {**by_zone_active, **by_zone_deleted},
+        "by_zone_active":   by_zone_active,
+        "by_zone_deleted":  by_zone_deleted,
         "fp": {
             "by_camera":                  fp_by_camera,
             "per_camera_per_week":        fp_per_camera_per_week,
