@@ -63,6 +63,30 @@ def _conn() -> sqlite3.Connection:
     return c
 
 
+_FZ_PHASE1_COLUMNS = (
+    # (name, sql-fragment) — additive only; defaults preserve current behavior.
+    ("dwell_s",          "REAL    NOT NULL DEFAULT 0.0"),
+    ("severity_tier",    "TEXT    NOT NULL DEFAULT 'CRITICAL'"),
+    ("time_window",      "TEXT    NOT NULL DEFAULT '*'"),
+    ("authorized_roles", "TEXT    NOT NULL DEFAULT '[]'"),
+    ("template_kind",    "TEXT    NOT NULL DEFAULT 'custom'"),
+)
+
+
+def _migrate_forbidden_zones(c: sqlite3.Connection) -> None:
+    """Idempotent additive migration for the Restricted Areas Phase 1 fields.
+
+    Reads PRAGMA table_info before each ALTER so re-running on an already
+    migrated DB is a no-op. Defaults are picked so existing rows behave
+    exactly as they did pre-migration (dwell=0, severity=CRITICAL, always-on).
+    """
+    existing = {row["name"] for row in c.execute("PRAGMA table_info(forbidden_zones)")}
+    for col, ddl in _FZ_PHASE1_COLUMNS:
+        if col not in existing:
+            c.execute(f"ALTER TABLE forbidden_zones ADD COLUMN {col} {ddl}")
+            log.info(f"forbidden_zones: added column {col}")
+
+
 def init_db():
     with _db_lock:
         c = _conn()
@@ -86,6 +110,7 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_fz_updated ON forbidden_zones(updated_at);
         """)
+        _migrate_forbidden_zones(c)
         c.commit()
         c.close()
     log.info(f"DB ready: {DB_PATH}")
@@ -452,9 +477,29 @@ def api_events(
 
 # ── Forbidden zones (operator-drawn polygons) ─────────────────────────────────
 
+_VALID_SEVERITY_TIERS = {"CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"}
+_VALID_TEMPLATE_KINDS = {"custom", "chemical", "electrical", "mezzanine", "dock", "fall"}
+
+
 class ZoneCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=120)
     polygon: list  # validated below — list of [x,y] pairs in 0..1
+    dwell_s: float = Field(default=0.0, ge=0.0, le=600.0)
+    severity_tier: str = "CRITICAL"
+    time_window: str = "*"
+    authorized_roles: list = Field(default_factory=list)
+    template_kind: str = "custom"
+
+
+class ZoneUpdate(BaseModel):
+    """All fields optional — only provided keys are updated."""
+    name: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    polygon: Optional[list] = None
+    dwell_s: Optional[float] = Field(default=None, ge=0.0, le=600.0)
+    severity_tier: Optional[str] = None
+    time_window: Optional[str] = None
+    authorized_roles: Optional[list] = None
+    template_kind: Optional[str] = None
 
 
 def _validate_polygon(polygon) -> str:
@@ -475,14 +520,87 @@ def _validate_polygon(polygon) -> str:
     return json.dumps(cleaned)
 
 
+def _validate_severity_tier(tier: str) -> str:
+    t = str(tier).upper()
+    if t not in _VALID_SEVERITY_TIERS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"severity_tier must be one of {sorted(_VALID_SEVERITY_TIERS)}",
+        )
+    return t
+
+
+def _validate_time_window(tw: str) -> str:
+    """Accept '*' (always-on) or 'HH:MM-HH:MM' (24h, wraps midnight if start > end)."""
+    s = str(tw).strip()
+    if s == "*" or s == "":
+        return "*"
+    parts = s.split("-")
+    if len(parts) != 2:
+        raise HTTPException(
+            status_code=400,
+            detail="time_window must be '*' or 'HH:MM-HH:MM'",
+        )
+    for chunk in parts:
+        hm = chunk.split(":")
+        if len(hm) != 2:
+            raise HTTPException(status_code=400, detail="time_window: bad HH:MM")
+        try:
+            h, m = int(hm[0]), int(hm[1])
+        except ValueError:
+            raise HTTPException(status_code=400, detail="time_window: HH:MM must be numeric")
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            raise HTTPException(status_code=400, detail="time_window: out of range")
+    return s
+
+
+def _validate_template_kind(kind: str) -> str:
+    k = str(kind).lower()
+    if k not in _VALID_TEMPLATE_KINDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"template_kind must be one of {sorted(_VALID_TEMPLATE_KINDS)}",
+        )
+    return k
+
+
+def _validate_roles(roles) -> str:
+    if not isinstance(roles, list):
+        raise HTTPException(status_code=400, detail="authorized_roles must be a list")
+    cleaned = []
+    for r in roles:
+        if not isinstance(r, str) or not r.strip():
+            raise HTTPException(status_code=400, detail="each role must be a non-empty string")
+        cleaned.append(r.strip()[:64])
+    return json.dumps(cleaned)
+
+
 def _row_to_zone(row) -> dict:
+    keys = row.keys() if hasattr(row, "keys") else []
+    def _g(k, default=None):
+        return row[k] if k in keys else default
+    try:
+        roles = json.loads(_g("authorized_roles") or "[]")
+    except Exception:
+        roles = []
     return {
-        "id":         row["id"],
-        "name":       row["name"],
-        "polygon":    json.loads(row["polygon"]),
-        "created_at": row["created_at"],
-        "updated_at": row["updated_at"],
+        "id":               row["id"],
+        "name":             row["name"],
+        "polygon":          json.loads(row["polygon"]),
+        "created_at":       row["created_at"],
+        "updated_at":       row["updated_at"],
+        "dwell_s":          float(_g("dwell_s", 0.0) or 0.0),
+        "severity_tier":    str(_g("severity_tier", "CRITICAL") or "CRITICAL"),
+        "time_window":      str(_g("time_window", "*") or "*"),
+        "authorized_roles": roles,
+        "template_kind":    str(_g("template_kind", "custom") or "custom"),
     }
+
+
+_ZONE_COLS = (
+    "id, name, polygon, created_at, updated_at, "
+    "dwell_s, severity_tier, time_window, authorized_roles, template_kind"
+)
 
 
 @app.get("/api/zones")
@@ -490,8 +608,7 @@ def api_zones_list():
     with _db_lock:
         c = _conn()
         rows = c.execute(
-            "SELECT id, name, polygon, created_at, updated_at "
-            "FROM forbidden_zones ORDER BY id"
+            f"SELECT {_ZONE_COLS} FROM forbidden_zones ORDER BY id"
         ).fetchall()
         c.close()
     return {"zones": [_row_to_zone(r) for r in rows]}
@@ -503,22 +620,75 @@ def api_zones_create(payload: ZoneCreate):
     name = payload.name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="name must not be empty")
+    severity = _validate_severity_tier(payload.severity_tier)
+    time_window = _validate_time_window(payload.time_window)
+    template = _validate_template_kind(payload.template_kind)
+    roles = _validate_roles(payload.authorized_roles)
     now = int(time.time())
     with _db_lock:
         c = _conn()
         cur = c.execute(
-            "INSERT INTO forbidden_zones (name, polygon, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?)",
-            (name, poly_json, now, now),
+            "INSERT INTO forbidden_zones "
+            "(name, polygon, created_at, updated_at, "
+            " dwell_s, severity_tier, time_window, authorized_roles, template_kind) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (name, poly_json, now, now,
+             float(payload.dwell_s), severity, time_window, roles, template),
         )
         row_id = cur.lastrowid
         c.commit()
         row = c.execute(
-            "SELECT id, name, polygon, created_at, updated_at "
-            "FROM forbidden_zones WHERE id=?", (row_id,),
+            f"SELECT {_ZONE_COLS} FROM forbidden_zones WHERE id=?", (row_id,),
         ).fetchone()
         c.close()
-    log.info(f"forbidden_zone created id={row_id} name={name!r}")
+    log.info(
+        f"forbidden_zone created id={row_id} name={name!r} "
+        f"template={template} severity={severity} dwell={payload.dwell_s} "
+        f"window={time_window}"
+    )
+    return _row_to_zone(row)
+
+
+@app.patch("/api/zones/{zone_id}")
+def api_zones_update(zone_id: int, payload: ZoneUpdate):
+    """Partial update — only fields present in the body are written."""
+    sets: list = []
+    args: list = []
+    if payload.name is not None:
+        n = payload.name.strip()
+        if not n:
+            raise HTTPException(status_code=400, detail="name must not be empty")
+        sets.append("name=?"); args.append(n)
+    if payload.polygon is not None:
+        sets.append("polygon=?"); args.append(_validate_polygon(payload.polygon))
+    if payload.dwell_s is not None:
+        sets.append("dwell_s=?"); args.append(float(payload.dwell_s))
+    if payload.severity_tier is not None:
+        sets.append("severity_tier=?"); args.append(_validate_severity_tier(payload.severity_tier))
+    if payload.time_window is not None:
+        sets.append("time_window=?"); args.append(_validate_time_window(payload.time_window))
+    if payload.authorized_roles is not None:
+        sets.append("authorized_roles=?"); args.append(_validate_roles(payload.authorized_roles))
+    if payload.template_kind is not None:
+        sets.append("template_kind=?"); args.append(_validate_template_kind(payload.template_kind))
+    if not sets:
+        raise HTTPException(status_code=400, detail="no fields to update")
+    sets.append("updated_at=?"); args.append(int(time.time()))
+    args.append(zone_id)
+    with _db_lock:
+        c = _conn()
+        cur = c.execute(
+            f"UPDATE forbidden_zones SET {', '.join(sets)} WHERE id=?", args,
+        )
+        if cur.rowcount == 0:
+            c.close()
+            raise HTTPException(status_code=404, detail="zone not found")
+        c.commit()
+        row = c.execute(
+            f"SELECT {_ZONE_COLS} FROM forbidden_zones WHERE id=?", (zone_id,),
+        ).fetchone()
+        c.close()
+    log.info(f"forbidden_zone updated id={zone_id} fields={[s.split('=')[0] for s in sets]}")
     return _row_to_zone(row)
 
 

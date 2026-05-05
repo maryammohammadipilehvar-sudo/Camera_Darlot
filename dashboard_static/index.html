@@ -245,6 +245,43 @@ body::after{content:'';position:fixed;inset:0;
   font-size:10px;color:var(--text2);background:rgba(0,0,0,.65);padding:5px 10px;
   border-radius:var(--r);letter-spacing:.5px;z-index:5}
 .zone-hint.hidden{display:none}
+.zone-popup .edit-btn{border-color:var(--accent);color:var(--accent);margin-right:6px}
+.zone-popup .edit-btn:hover{background:var(--accent);color:#04110a}
+
+/* ── Zone config modal (Restricted Areas Phase 1) ──────────────────────── */
+.zone-modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.7);
+  display:flex;align-items:center;justify-content:center;z-index:20;
+  font-family:var(--font-ui)}
+.zone-modal-backdrop.hidden{display:none}
+.zone-modal{background:var(--bg2);border:1px solid var(--border2);
+  border-radius:var(--r);padding:18px 22px;width:min(440px,92vw);
+  max-height:90vh;overflow:auto;box-shadow:0 8px 32px rgba(0,0,0,.6);
+  color:var(--text)}
+.zone-modal h3{margin:0 0 14px;font-size:14px;letter-spacing:1px;
+  color:var(--accent);font-weight:700}
+.zone-modal label{display:block;margin-bottom:12px;font-size:11px;
+  letter-spacing:.5px;color:var(--text2);font-weight:600}
+.zone-modal input[type="text"],
+.zone-modal input[type="number"],
+.zone-modal select{width:100%;margin-top:4px;padding:7px 10px;
+  background:var(--bg);border:1px solid var(--border);
+  border-radius:var(--r);color:var(--text);font-size:12px;
+  font-family:var(--font-ui);box-sizing:border-box}
+.zone-modal input:focus,.zone-modal select:focus{outline:none;
+  border-color:var(--accent)}
+.zone-modal .row{display:flex;gap:10px}
+.zone-modal .row label{flex:1}
+.zone-modal .hint{font-size:10px;color:var(--text3);font-weight:400;
+  margin-top:3px;line-height:1.4}
+.zone-modal-acts{display:flex;justify-content:flex-end;gap:8px;
+  margin-top:18px;padding-top:14px;border-top:1px solid var(--border)}
+.zone-modal-acts button{padding:7px 16px;font-size:11px;font-weight:600;
+  letter-spacing:1px;border-radius:var(--r);cursor:pointer;
+  border:1px solid var(--border2);background:transparent;color:var(--text)}
+.zone-modal-acts button:hover{border-color:var(--accent);color:var(--accent)}
+.zone-modal-acts button.primary{background:var(--accent);color:#04110a;
+  border-color:var(--accent)}
+.zone-modal-acts button.primary:hover{filter:brightness(1.1)}
 
 #stream-img{width:100%;height:100%;object-fit:contain;opacity:0;
   transition:opacity .6s;display:block}
@@ -1484,15 +1521,29 @@ async function zoneFetchAll(){
   }
 }
 
-async function zoneCreate(name, polygon){
+async function zoneCreate(form, polygon){
+  const body = Object.assign({polygon}, form);
   const r = await fetch('/api/zones', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({name, polygon}),
+    body: JSON.stringify(body),
   });
   if(!r.ok){
     const err = await r.text();
     throw new Error('Create failed: ' + err);
+  }
+  return r.json();
+}
+
+async function zoneUpdate(id, fields){
+  const r = await fetch('/api/zones/' + id, {
+    method: 'PATCH',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(fields),
+  });
+  if(!r.ok){
+    const err = await r.text();
+    throw new Error('Update failed: ' + err);
   }
   return r.json();
 }
@@ -1518,11 +1569,25 @@ function zoneShowPopup(zone, clientX, clientY){
   div.className = 'zone-popup';
   div.style.left = (clientX - wr.left + 8) + 'px';
   div.style.top  = (clientY - wr.top  + 8) + 'px';
+  // Summary line: template + severity + time window so the operator can
+  // tell zones apart at a glance without opening Edit.
+  const tier = (zone.severity_tier || 'CRITICAL').toUpperCase();
+  const win  = zone.time_window || '*';
+  const dw   = zone.dwell_s ? `, dwell ${zone.dwell_s}s` : '';
+  const winText = win === '*' ? 'always' : win;
   div.innerHTML =
     `<div class="zone-popup-name"></div>` +
+    `<div class="hint" style="font-size:10px;color:var(--text3);margin-bottom:8px"></div>` +
+    `<button type="button" class="edit-btn">Edit</button>` +
     `<button type="button">Delete</button>`;
   div.querySelector('.zone-popup-name').textContent = zone.name || ('Zone #' + zone.id);
-  div.querySelector('button').addEventListener('click', async () => {
+  div.querySelector('.hint').textContent = `${tier} · ${winText}${dw}`;
+  div.querySelector('.edit-btn').addEventListener('click', () => {
+    zoneClosePopup();
+    zoneModalOpen({mode:'edit', zone:zone});
+  });
+  div.querySelector('button:not(.edit-btn)').addEventListener('click', async () => {
+    if(!confirm(`Delete zone "${zone.name}"?`)) return;
     try{
       await zoneDelete(zone.id);
       await zoneFetchAll();
@@ -1561,21 +1626,110 @@ function zoneToggleDraw(){
   zoneRender();
 }
 
+// Built-in template defaults — must mirror server-side _VALID_TEMPLATE_KINDS.
+const ZONE_TEMPLATES = {
+  custom:     {dwell_s:0,   severity_tier:'CRITICAL', time_window:'*',
+               name_hint:'Forbidden zone'},
+  chemical:   {dwell_s:5,   severity_tier:'CRITICAL', time_window:'*',
+               name_hint:'Chem Cage'},
+  electrical: {dwell_s:0,   severity_tier:'CRITICAL', time_window:'*',
+               name_hint:'Electrical Room'},
+  mezzanine:  {dwell_s:0,   severity_tier:'CRITICAL', time_window:'*',
+               name_hint:'Mezzanine Edge'},
+  dock:       {dwell_s:0,   severity_tier:'CRITICAL', time_window:'20:00-06:00',
+               name_hint:'Dock Edge'},
+  fall:       {dwell_s:0,   severity_tier:'CRITICAL', time_window:'*',
+               name_hint:'Fall Zone'},
+};
+
+// Modal state — either creating a new zone (mode='create' + draftPts) or
+// editing an existing one (mode='edit' + zoneId).
+const _zoneModal = {mode:null, draftPts:null, zoneId:null};
+
+function zoneApplyTemplate(kind){
+  const t = ZONE_TEMPLATES[kind] || ZONE_TEMPLATES.custom;
+  document.getElementById('zone-f-dwell').value    = t.dwell_s;
+  document.getElementById('zone-f-severity').value = t.severity_tier;
+  document.getElementById('zone-f-window').value   = t.time_window;
+  // Only auto-fill name when it's empty, so editing doesn't clobber.
+  const nameEl = document.getElementById('zone-f-name');
+  if(_zoneModal.mode === 'create' && !nameEl.value){
+    nameEl.value = t.name_hint;
+  }
+}
+
+function zoneModalOpen(opts){
+  // opts: {mode:'create',draftPts:[]} OR {mode:'edit',zone:{...}}
+  _zoneModal.mode    = opts.mode;
+  _zoneModal.draftPts = opts.draftPts || null;
+  _zoneModal.zoneId  = opts.zone ? opts.zone.id : null;
+
+  document.getElementById('zone-modal-title').textContent =
+    opts.mode === 'edit' ? 'Edit restricted area' : 'Configure restricted area';
+
+  const z = opts.zone || {};
+  document.getElementById('zone-f-template').value = z.template_kind || 'custom';
+  document.getElementById('zone-f-name').value     = z.name || '';
+  document.getElementById('zone-f-severity').value = (z.severity_tier || 'CRITICAL').toUpperCase();
+  document.getElementById('zone-f-dwell').value    = z.dwell_s != null ? z.dwell_s : 0;
+  document.getElementById('zone-f-window').value   = z.time_window || '*';
+  document.getElementById('zone-f-roles').value    = (z.authorized_roles || []).join(', ');
+
+  if(opts.mode === 'create'){
+    zoneApplyTemplate(document.getElementById('zone-f-template').value);
+  }
+  document.getElementById('zone-modal-backdrop').classList.remove('hidden');
+  setTimeout(()=>document.getElementById('zone-f-name').focus(), 50);
+}
+
+function zoneModalClose(){
+  document.getElementById('zone-modal-backdrop').classList.add('hidden');
+  _zoneModal.mode = null;
+  _zoneModal.draftPts = null;
+  _zoneModal.zoneId = null;
+}
+
+function _zoneCollectForm(){
+  const name = (document.getElementById('zone-f-name').value || '').trim();
+  if(!name){ alert('Zone name is required'); return null; }
+  const rolesRaw = (document.getElementById('zone-f-roles').value || '').trim();
+  const roles = rolesRaw
+    ? rolesRaw.split(',').map(s => s.trim()).filter(Boolean)
+    : [];
+  return {
+    name,
+    dwell_s:          parseFloat(document.getElementById('zone-f-dwell').value) || 0,
+    severity_tier:    document.getElementById('zone-f-severity').value,
+    time_window:      (document.getElementById('zone-f-window').value || '*').trim() || '*',
+    authorized_roles: roles,
+    template_kind:    document.getElementById('zone-f-template').value,
+  };
+}
+
+async function zoneModalSave(){
+  const form = _zoneCollectForm();
+  if(!form) return;
+  try{
+    if(_zoneModal.mode === 'create'){
+      await zoneCreate(form, _zoneModal.draftPts);
+    } else if(_zoneModal.mode === 'edit'){
+      await zoneUpdate(_zoneModal.zoneId, form);
+    }
+    zoneModalClose();
+    await zoneFetchAll();
+  } catch(e){
+    alert(String(e));
+  }
+}
+
 async function _zoneFinish(){
   if(_zoneState.draftPts.length < 3){
     return;
   }
   const points = _zoneState.draftPts.slice();
-  // End drawing mode immediately so the prompt isn't competing with canvas state.
+  // End drawing mode immediately so the modal isn't competing with canvas state.
   zoneToggleDraw();
-  const name = (window.prompt('Zone name:', 'Forbidden zone') || '').trim();
-  if(!name) return;
-  try{
-    await zoneCreate(name, points);
-    await zoneFetchAll();
-  } catch(e){
-    alert(String(e));
-  }
+  zoneModalOpen({mode:'create', draftPts:points});
 }
 
 function _zoneOnMove(evt){
@@ -1840,5 +1994,62 @@ document.addEventListener('DOMContentLoaded',()=>{
   tick();
 });
 </script>
+
+<!-- ── Restricted Areas: zone config modal ─────────────────────────────── -->
+<div id="zone-modal-backdrop" class="zone-modal-backdrop hidden"
+     onclick="if(event.target===this)zoneModalClose()">
+  <div class="zone-modal" role="dialog" aria-labelledby="zone-modal-title">
+    <h3 id="zone-modal-title">Configure restricted area</h3>
+
+    <label>Template
+      <select id="zone-f-template" onchange="zoneApplyTemplate(this.value)">
+        <option value="custom">Custom (no preset)</option>
+        <option value="chemical">Chemical storage</option>
+        <option value="electrical">Electrical room</option>
+        <option value="mezzanine">Mezzanine edge</option>
+        <option value="dock">Dock edge</option>
+        <option value="fall">High-rack fall zone</option>
+      </select>
+      <div class="hint">Pre-fills sensible defaults for this kind of zone — you can still edit any field.</div>
+    </label>
+
+    <label>Zone name
+      <input type="text" id="zone-f-name" maxlength="120"
+             placeholder="e.g. Chem Cage – Aisle 7" />
+    </label>
+
+    <div class="row">
+      <label>Severity
+        <select id="zone-f-severity">
+          <option value="CRITICAL">CRITICAL</option>
+          <option value="HIGH">HIGH</option>
+          <option value="MEDIUM">MEDIUM</option>
+          <option value="LOW">LOW</option>
+          <option value="INFO">INFO</option>
+        </select>
+      </label>
+      <label>Dwell (s)
+        <input type="number" id="zone-f-dwell" min="0" max="600" step="0.5" value="0" />
+        <div class="hint">0 = fire on entry. 5+ ignores walking past.</div>
+      </label>
+    </div>
+
+    <label>Active hours
+      <input type="text" id="zone-f-window" placeholder="* or HH:MM-HH:MM (24h)" value="*" />
+      <div class="hint"><code>*</code> = always. <code>20:00-06:00</code> wraps midnight.</div>
+    </label>
+
+    <label>Authorized roles (comma-separated)
+      <input type="text" id="zone-f-roles" placeholder="e.g. supervisor, hazmat" />
+      <div class="hint">Phase 2 — stored now, applied once badge / vest detection lands.</div>
+    </label>
+
+    <div class="zone-modal-acts">
+      <button type="button" onclick="zoneModalClose()">Cancel</button>
+      <button type="button" class="primary" onclick="zoneModalSave()">Save</button>
+    </div>
+  </div>
+</div>
+
 </body>
 </html>

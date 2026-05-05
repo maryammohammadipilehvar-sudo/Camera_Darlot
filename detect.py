@@ -177,8 +177,15 @@ CFG = {
         "behavior:fighting":  {"OCCUPIED": "LOW",      "CLOSED": "MEDIUM",   "MAINTENANCE": "LOW"},
         "behavior:running":   {"OCCUPIED": "LOW",      "CLOSED": "LOW",      "MAINTENANCE": "LOW"},
         # Operator-defined forbidden zones — person inside any saved
-        # polygon. Operator brief: CRITICAL all modes.
-        "forbidden_zone":     {"OCCUPIED": "CRITICAL", "CLOSED": "CRITICAL", "MAINTENANCE": "CRITICAL"},
+        # polygon. Bare row is the legacy default (no per-zone tier
+        # configured). Subtype rows let each zone pick its own severity
+        # via the Phase 1 severity_tier field stored on the polygon row.
+        "forbidden_zone":          {"OCCUPIED": "CRITICAL", "CLOSED": "CRITICAL", "MAINTENANCE": "CRITICAL"},
+        "forbidden_zone:critical": {"OCCUPIED": "CRITICAL", "CLOSED": "CRITICAL", "MAINTENANCE": "CRITICAL"},
+        "forbidden_zone:high":     {"OCCUPIED": "HIGH",     "CLOSED": "HIGH",     "MAINTENANCE": "HIGH"},
+        "forbidden_zone:medium":   {"OCCUPIED": "MEDIUM",   "CLOSED": "MEDIUM",   "MAINTENANCE": "LOW"},
+        "forbidden_zone:low":      {"OCCUPIED": "LOW",      "CLOSED": "MEDIUM",   "MAINTENANCE": "LOW"},
+        "forbidden_zone:info":     {"OCCUPIED": "INFO",     "CLOSED": "LOW",      "MAINTENANCE": "INFO"},
         # Predicted intrusion — extrapolated trajectory enters a forbidden
         # zone before the person physically does. Designed as an
         # *early warning*: HIGH during business hours (telegram, but
@@ -890,6 +897,14 @@ def _subtype_of(kind: str, detail: dict) -> str:
         action = str(detail.get("action") or "").lower()
         if action in ("fallen", "fighting", "running"):
             return action
+        return ""
+    if k == "forbidden_zone":
+        # Per-zone severity (Phase 1 Restricted Areas). The rule stamps
+        # detail.severity_tier from the zone config; we lowercase it
+        # so the table key is forbidden_zone:critical etc.
+        tier = str(detail.get("severity_tier") or "").lower()
+        if tier in ("critical", "high", "medium", "low", "info"):
+            return tier
         return ""
     return ""
 
@@ -2119,10 +2134,20 @@ class ForbiddenZoneEngine:
         if self._conn is None:
             return
         new: list = []
+        # Phase 1 columns are nullable in the wild (newly-migrated DBs may
+        # have rows from before the ALTER). COALESCE in SQL keeps the
+        # Python side simple — no per-field None checks downstream.
+        sql = (
+            "SELECT id, name, polygon, "
+            "       COALESCE(dwell_s, 0.0)              AS dwell_s, "
+            "       COALESCE(severity_tier, 'CRITICAL') AS severity_tier, "
+            "       COALESCE(time_window, '*')          AS time_window, "
+            "       COALESCE(authorized_roles, '[]')    AS authorized_roles, "
+            "       COALESCE(template_kind, 'custom')   AS template_kind "
+            "FROM forbidden_zones ORDER BY id"
+        )
         try:
-            for row in self._conn.execute(
-                "SELECT id, name, polygon FROM forbidden_zones ORDER BY id"
-            ):
+            for row in self._conn.execute(sql):
                 try:
                     pts = json.loads(row[2])
                     poly = np.array(
@@ -2131,15 +2156,55 @@ class ForbiddenZoneEngine:
                          for p in pts],
                         dtype=np.int32,
                     )
-                    if len(poly) >= 3:
-                        new.append({"id": int(row[0]), "name": str(row[1]), "poly": poly})
+                    if len(poly) < 3:
+                        continue
+                    try:
+                        roles = json.loads(row[7] or "[]")
+                    except Exception:
+                        roles = []
+                    new.append({
+                        "id":               int(row[0]),
+                        "name":             str(row[1]),
+                        "poly":             poly,
+                        "dwell_s":          float(row[3]),
+                        "severity_tier":    str(row[4]).upper(),
+                        "time_window":      str(row[5]) or "*",
+                        "authorized_roles": roles,
+                        "template_kind":    str(row[8]),
+                    })
                 except Exception as e:
                     log.warning(
                         "FORBIDDEN_ZONE: skipping malformed polygon id=%s: %s",
                         row[0], e,
                     )
-        except sqlite3.OperationalError:
-            pass  # table not yet created
+        except sqlite3.OperationalError as e:
+            # Table not yet created OR Phase 1 migration not yet applied.
+            # Fall back to legacy SELECT so the pipeline keeps working
+            # against an old DB until the dashboard restarts and migrates.
+            log.warning("FORBIDDEN_ZONE: extended SELECT failed (%s); falling back", e)
+            try:
+                for row in self._conn.execute(
+                    "SELECT id, name, polygon FROM forbidden_zones ORDER BY id"
+                ):
+                    try:
+                        pts = json.loads(row[2])
+                        poly = np.array(
+                            [[round(float(p[0]) * self._frame_w),
+                              round(float(p[1]) * self._frame_h)]
+                             for p in pts],
+                            dtype=np.int32,
+                        )
+                        if len(poly) >= 3:
+                            new.append({
+                                "id": int(row[0]), "name": str(row[1]), "poly": poly,
+                                "dwell_s": 0.0, "severity_tier": "CRITICAL",
+                                "time_window": "*", "authorized_roles": [],
+                                "template_kind": "custom",
+                            })
+                    except Exception:
+                        continue
+            except sqlite3.OperationalError:
+                pass  # table doesn't exist yet
         except Exception as e:
             log.warning("FORBIDDEN_ZONE: reload failed: %s", e)
             return
