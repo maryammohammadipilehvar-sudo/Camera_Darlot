@@ -1314,6 +1314,78 @@ def api_stats():
     return stats
 
 
+@app.get("/api/heatmap")
+def api_heatmap(
+    days:    int = Query(default=14, ge=1, le=180),
+    camera:  Optional[str] = None,
+    grid_w:  int = Query(default=24, ge=4, le=80),
+    grid_h:  int = Query(default=14, ge=4, le=60),
+    frame_w: int = Query(default=640, ge=64, le=4096),
+    frame_h: int = Query(default=360, ge=64, le=4096),
+):
+    """Aggregate forbidden_zone event centroids into a 2D grid (Phase 4c).
+
+    Reads bbox centers from event detail.bbox (inference-frame pixels)
+    and bins them into a ``grid_w × grid_h`` matrix. The operator gets
+    a quick visual of where the alerts cluster — useful for "do I need
+    signage here?" or "is this aisle a chokepoint?".
+
+    Returns:
+        rows:    grid_h rows × grid_w columns of integer counts.
+        max:     max cell value (used by the UI to scale colour).
+        total:   sum of all cells.
+        window:  {since, until, days}.
+        frame:   {w, h} echoed back so the canvas can match aspect.
+    """
+    until = int(time.time())
+    since = until - days * 86400
+    args: list = [since, until]
+    cam_clause = ""
+    if camera:
+        cam_clause = " AND camera=?"
+        args.append(camera)
+
+    grid: list = [[0] * grid_w for _ in range(grid_h)]
+    total = 0
+    cmax = 0
+    with _db_lock:
+        c = _conn()
+        rows = c.execute(
+            f"SELECT detail FROM events WHERE kind='forbidden_zone' "
+            f"AND ts>=? AND ts<=?{cam_clause}",
+            args,
+        ).fetchall()
+        c.close()
+
+    for r in rows:
+        d = _detail_dict(r["detail"])
+        bbox = d.get("bbox")
+        if not (isinstance(bbox, list) and len(bbox) == 4):
+            continue
+        try:
+            cx = (int(bbox[0]) + int(bbox[2])) / 2.0
+            cy = (int(bbox[1]) + int(bbox[3])) / 2.0
+        except Exception:
+            continue
+        gx = int((cx / frame_w) * grid_w)
+        gy = int((cy / frame_h) * grid_h)
+        gx = max(0, min(grid_w - 1, gx))
+        gy = max(0, min(grid_h - 1, gy))
+        grid[gy][gx] += 1
+        total += 1
+        if grid[gy][gx] > cmax:
+            cmax = grid[gy][gx]
+
+    return {
+        "rows":   grid,
+        "max":    cmax,
+        "total":  total,
+        "window": {"since": since, "until": until, "days": days},
+        "frame":  {"w": frame_w, "h": frame_h},
+        "grid":   {"w": grid_w,  "h": grid_h},
+    }
+
+
 def _detail_dict(raw) -> dict:
     if isinstance(raw, dict):
         return raw

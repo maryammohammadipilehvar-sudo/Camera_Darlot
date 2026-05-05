@@ -849,6 +849,27 @@ td.trunc{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
         <table id="r-fp"><thead><tr><th>Camera</th><th class="num">FP last window</th><th class="num">Per week</th><th>Status</th></tr></thead><tbody></tbody></table>
       </div>
 
+      <div class="r-card" style="margin-bottom:18px">
+        <h3>Hotspot heatmap</h3>
+        <p class="note">
+          Where forbidden-zone events have clustered in the camera frame
+          over the selected window. Brighter = more events. Use it to
+          decide where to add signage, restripe lanes, or move equipment.
+        </p>
+        <div id="r-heatmap-wrap" style="position:relative;background:var(--bg);
+             border:1px solid var(--border2);border-radius:var(--r);
+             aspect-ratio:16/9;max-width:720px;overflow:hidden">
+          <canvas id="r-heatmap" style="width:100%;height:100%;display:block"></canvas>
+          <div id="r-heatmap-empty" style="position:absolute;inset:0;
+               display:flex;align-items:center;justify-content:center;
+               color:var(--text2);font-size:13px;font-style:italic">
+            No forbidden-zone events in this window.
+          </div>
+        </div>
+        <div id="r-heatmap-legend" style="font-size:12px;color:var(--text2);
+             margin-top:8px"></div>
+      </div>
+
       <div class="r-card">
         <h3>Sample events for spot-check</h3>
         <div class="r-samples" id="r-samples"></div>
@@ -1044,6 +1065,63 @@ async function fetchFeed(){
 }
 
 // ── Reports ──────────────────────────────────────────────────────────────────
+async function fetchHeatmap(days, cam){
+  const params = new URLSearchParams({days, grid_w:'24', grid_h:'14',
+                                      frame_w:'640', frame_h:'360'});
+  if(cam) params.set('camera', cam);
+  try{
+    const r = await fetch('/api/heatmap?' + params.toString());
+    if(!r.ok) throw new Error('http ' + r.status);
+    return await r.json();
+  } catch(e){
+    console.warn('heatmap fetch failed:', e);
+    return null;
+  }
+}
+
+function renderHeatmap(data){
+  const empty = document.getElementById('r-heatmap-empty');
+  const legend = document.getElementById('r-heatmap-legend');
+  const canvas = document.getElementById('r-heatmap');
+  if(!canvas || !empty || !legend) return;
+  const total = data && data.total ? data.total : 0;
+  empty.style.display = total > 0 ? 'none' : 'flex';
+  if(total === 0){
+    legend.textContent = '';
+    canvas.width = canvas.clientWidth || 1;
+    canvas.height = canvas.clientHeight || 1;
+    canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
+    return;
+  }
+  // Match the canvas backing-store to its CSS size for crisp pixels.
+  const css_w = canvas.clientWidth, css_h = canvas.clientHeight;
+  canvas.width  = css_w;
+  canvas.height = css_h;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, css_w, css_h);
+  const gw = data.grid.w, gh = data.grid.h;
+  const cell_w = css_w / gw;
+  const cell_h = css_h / gh;
+  const cmax = Math.max(1, data.max);
+  for(let y = 0; y < gh; y++){
+    for(let x = 0; x < gw; x++){
+      const v = data.rows[y][x];
+      if(!v) continue;
+      // Heat ramp: dark red → bright orange/yellow → white at peak.
+      const t = v / cmax;
+      const r = Math.round(120 + 135 * t);
+      const g = Math.round(20 + 200 * t * t);
+      const b = Math.round(20 * (1 - t));
+      const a = 0.35 + 0.55 * t;
+      ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${a})`;
+      ctx.fillRect(x * cell_w, y * cell_h, cell_w + 0.5, cell_h + 0.5);
+    }
+  }
+  legend.textContent = `${data.total} event${data.total === 1 ? '' : 's'} ` +
+    `over ${data.window.days} day${data.window.days === 1 ? '' : 's'}; ` +
+    `peak cell = ${data.max}.`;
+}
+
 async function fetchReport(){
   const days = document.getElementById('r-days').value;
   const cam  = document.getElementById('r-camera').value;
@@ -1192,6 +1270,12 @@ function renderReport(data){
       cs.appendChild(o);
     }
   }
+
+  // Heatmap is fetched independently so the rest of the report renders
+  // even if the heatmap endpoint is older than the report fix.
+  fetchHeatmap(data.window.days, document.getElementById('r-camera').value)
+    .then(renderHeatmap)
+    .catch(() => {/* already logged */});
 }
 
 async function _openEventById(id){
